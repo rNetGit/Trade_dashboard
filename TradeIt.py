@@ -12,7 +12,7 @@ from ta_utils import (
 
 # ───────────────────────────── App chrome ─────────────────────────────
 st.set_page_config(page_title="TradeIt", page_icon="📈", layout="wide")
-st.title("✨ TradeIt — 4H & Daily Analyzer")
+st.title("✨ iTrader — 4H & Daily Analyzer")
 
 # Minimal high-contrast mobile-friendly CSS + nicer cards
 st.markdown("""
@@ -128,7 +128,7 @@ if not symbols:
     st.stop()
 
 # ───────────────────────────── Overview cards ─────────────────────────────
-st.subheader("Overview (4H Day-Trade & 1D Swing)")
+st.subheader("Overview (4H/1D Analyzer)")
 
 cols_per_row = 3
 syms = list(symbols.keys())
