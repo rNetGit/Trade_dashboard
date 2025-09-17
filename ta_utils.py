@@ -1,8 +1,21 @@
-
 import numpy as np
 import pandas as pd
 
-# ===== Core Indicators =====
+# ---------------- Helpers ----------------
+
+
+def _to_naive_utc_index(series: pd.Series) -> pd.DatetimeIndex:
+    """
+    Parse any mix of tz-aware/naive strings to UTC, then drop tz to get a naive DatetimeIndex.
+    Non-parsable rows become NaT (we drop them later).
+    """
+    # Parse to UTC first (handles tz-aware and naive inputs)
+    s = pd.to_datetime(series, utc=True, errors="coerce")     # -> Series[datetime64[ns, UTC]]
+    # Convert to a DatetimeIndex, then drop timezone to make it naive
+    idx = pd.DatetimeIndex(s).tz_convert(None)                # -> DatetimeIndex[datetime64[ns]]
+    return idx
+
+# ---------------- Core Indicators ----------------
 def calculate_rsi(prices: pd.Series, window: int = 14) -> pd.Series:
     delta = prices.diff()
     up = delta.clip(lower=0)
@@ -23,9 +36,10 @@ def calculate_macd(prices: pd.Series, fast: int = 12, slow: int = 26, signal: in
     return macd, signal_line
 
 def calculate_vwap(df: pd.DataFrame) -> pd.Series:
-    if "volume" not in df.columns:
+    if "volume" not in df.columns or df["volume"].isna().all():
         return pd.Series(np.nan, index=df.index)
-    pv = df["close"] * df["volume"]
+    tp = df["close"]
+    pv = tp * df["volume"]
     return pv.cumsum() / df["volume"].cumsum()
 
 def calculate_atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
@@ -34,7 +48,7 @@ def calculate_atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
     tr = np.maximum(h - l, np.maximum((h - prev_c).abs(), (l - prev_c).abs()))
     return tr.rolling(window).mean()
 
-# ===== Robust Support/Resistance =====
+# ---------------- Robust Support/Resistance ----------------
 def _pivot_points(df: pd.DataFrame):
     prev = df.shift(1)
     P = (prev["high"] + prev["low"] + prev["close"]) / 3.0
@@ -64,82 +78,53 @@ def _round_levels(price: float, steps=(5, 10, 25, 50, 100)):
         s.add(round((price - step / 2) / step) * step)
     return sorted(s)
 
-def get_levels(df: pd.DataFrame):
-    """Backwards compatible simple levels (5/10-day extremes)."""
-    high_5d = df.tail(5)["high"].max()
-    low_5d = df.tail(5)["low"].min()
-    high_10d = df.tail(10)["high"].max()
-    low_10d = df.tail(10)["low"].min()
-    return high_5d, low_5d, high_10d, low_10d
-
 def fused_levels(df: pd.DataFrame, lookbacks=(5, 10, 20)):
-    """Fuse multiple S/R methods and score confluence.
-    Returns: {"support":[(level,score),...], "resistance":[(level,score),...]}
-    """
     price = float(df["close"].iloc[-1])
     levels = []
-
-    # Rolling extremes
     for n in lookbacks:
         levels.append((float(df["high"].rolling(n).max().iloc[-1]), "R"))
         levels.append((float(df["low"].rolling(n).min().iloc[-1]), "S"))
-
-    # Donchian
     du, dl, _ = _donchian(df, n=max(lookbacks))
     if not np.isnan(du.iloc[-1]):
         levels.append((float(du.iloc[-1]), "R"))
         levels.append((float(dl.iloc[-1]), "S"))
-
-    # Pivots
     P, R1, S1, R2, S2 = _pivot_points(df)
-    for val, tag in [(R1.iloc[-1], "R"), (S1.iloc[-1], "S"), (R2.iloc[-1], "R"), (S2.iloc[-1], "S"), (P.iloc[-1], "M")]:
-        if not np.isnan(val):
-            levels.append((float(val), tag))
-
-    # Fractals (last few)
+    for v, t in [(R1.iloc[-1], "R"), (S1.iloc[-1], "S"), (R2.iloc[-1], "R"), (S2.iloc[-1], "S"), (P.iloc[-1], "M")]:
+        if not np.isnan(v): levels.append((float(v), t))
     sh, sl = _fractals(df)
     levels += [(float(v), "R") for v in sh.tail(6).values]
     levels += [(float(v), "S") for v in sl.tail(6).values]
 
-    # Aggregate near-duplicates within tolerance
     tol = max(0.002 * price, df["close"].diff().abs().tail(50).mean() or 1.0)
     buckets = []
     for lv, tag in levels:
         placed = False
         for b in buckets:
             if abs(b["level"] - lv) <= tol:
-                b["cnt"] += 1
-                b["tags"].add(tag)
+                b["cnt"] += 1; b["tags"].add(tag)
                 b["level"] = (b["level"] * b["w"] + lv) / (b["w"] + 1)
-                b["w"] += 1
-                placed = True
-                break
+                b["w"] += 1; placed = True; break
         if not placed:
             buckets.append({"level": lv, "cnt": 1, "tags": set([tag]), "w": 1})
 
     supports, resistances = [], []
     for b in buckets:
-        level = float(b["level"])
-        score = b["cnt"]
-        if "S" in b["tags"] and "R" in b["tags"]:
-            score += 1  # mixed confluence bonus
-        if any(abs(level - rn) <= tol for rn in _round_levels(price)):
-            score += 0.5  # round-number magnet
+        level = float(b["level"]); score = b["cnt"]
+        if "S" in b["tags"] and "R" in b["tags"]: score += 1
+        if any(abs(level - rn) <= tol for rn in _round_levels(price)): score += 0.5
         (supports if level <= price else resistances).append((level, score))
 
     supports = sorted(supports, key=lambda x: (abs(price - x[0]), -x[1]))[:5]
     resistances = sorted(resistances, key=lambda x: (abs(x[0] - price), -x[1]))[:5]
     return {"support": supports, "resistance": resistances}
 
-# ===== Trend + Trade Plan =====
+# ---------------- Trend & Trade Plan ----------------
 def classify_trend(close: pd.Series, ema20: pd.Series, ema50: pd.Series) -> str:
     price = float(close.iloc[-1])
     e20 = float(ema20.iloc[-1])
     e50 = float(ema50.iloc[-1])
-    if price > e20 > e50:
-        return "up"
-    if price < e20 < e50:
-        return "down"
+    if price > e20 > e50: return "up"
+    if price < e20 < e50: return "down"
     return "sideways"
 
 def build_trade_plan(df: pd.DataFrame):
@@ -148,31 +133,91 @@ def build_trade_plan(df: pd.DataFrame):
     _atr = float(_atr) if not np.isnan(_atr) else max(1.0, price * 0.005)
     levels = fused_levels(df)
     trend = classify_trend(df["close"], calculate_ema(df["close"], 20), calculate_ema(df["close"], 50))
-
     if trend == "up":
         res = levels["resistance"][0][0] if levels["resistance"] else price + 0.5 * _atr
         sup = levels["support"][0][0] if levels["support"] else price - 1.0 * _atr
-        entry = max(price, res + 0.1 * _atr)
-        stop = sup - 0.5 * _atr
+        entry = max(price, res + 0.1 * _atr); stop = sup - 0.5 * _atr
         t1, t2 = entry + 1.0 * _atr, entry + 2.0 * _atr
-        bias, strat = "BULLISH", "Put Credit Spread (PCS) / Stock long"
+        bias, strat = "BULLISH", "Put Credit Spread (PCS) / Long bias"
     elif trend == "down":
         res = levels["resistance"][0][0] if levels["resistance"] else price + 1.0 * _atr
         sup = levels["support"][0][0] if levels["support"] else price - 0.5 * _atr
-        entry = min(price, sup - 0.1 * _atr)
-        stop = res + 0.5 * _atr
+        entry = min(price, sup - 0.1 * _atr); stop = res + 0.5 * _atr
         t1, t2 = entry - 1.0 * _atr, entry - 2.0 * _atr
-        bias, strat = "BEARISH", "Call Credit Spread (CCS) / Stock short"
+        bias, strat = "BEARISH", "Call Credit Spread (CCS) / Short bias"
     else:
         if levels["resistance"] and levels["support"]:
-            top = levels["resistance"][0][0]
-            bot = levels["support"][0][0]
+            top = levels["resistance"][0][0]; bot = levels["support"][0][0]
         else:
             top, bot = price + 1.5 * _atr, price - 1.5 * _atr
-        entry = None
-        stop = None
+        entry = None; stop = None
         t1 = (top + bot) / 2.0
         t2 = top if abs(top - price) < abs(price - bot) else bot
         bias, strat = "NEUTRAL", "Iron Condor / Butterflies"
-
     return {"bias": bias, "strategy": strat, "atr": _atr, "levels": levels, "entry": entry, "stop": stop, "targets": [t1, t2]}
+
+# ---------------- Timeframe helpers & projections ----------------
+def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    d = df.copy()
+    idx = _to_naive_utc_index(d["date"])
+    mask = ~idx.isna()
+    d = d.loc[mask].copy()
+    idx = idx[mask]
+    d.index = idx
+    d = d.sort_index()
+
+    for c in ["open", "high", "low", "close"]:
+        if c not in d.columns:
+            d[c] = d["close"]
+
+    o = d["open"].resample(rule).first()
+    h = d["high"].resample(rule).max()
+    l = d["low"].resample(rule).min()
+    c = d["close"].resample(rule).last()
+    if "volume" in d.columns:
+        v = d["volume"].resample(rule).sum()
+        out = pd.DataFrame({"date": o.index, "open": o.values, "high": h.values, "low": l.values, "close": c.values, "volume": v.values})
+    else:
+        out = pd.DataFrame({"date": o.index, "open": o.values, "high": h.values, "low": l.values, "close": c.values})
+
+    return out.dropna().reset_index(drop=True)
+
+def project_day_range(df_day: pd.DataFrame):
+    if len(df_day) < 15: return None
+    prev = df_day.iloc[-2]
+    atr_d = calculate_atr(df_day).iloc[-1]
+    return {
+        "proj_hi": float(prev["close"] + (atr_d if not np.isnan(atr_d) else (prev["high"]-prev["low"]))),
+        "proj_lo": float(prev["close"] - (atr_d if not np.isnan(atr_d) else (prev["high"]-prev["low"]))),
+    }
+
+def project_week_range(df_day: pd.DataFrame):
+    if len(df_day) < 40: return None
+    d = df_day.set_index(pd.to_datetime(df_day["date"]))
+    wk = pd.DataFrame({
+        "high": d["high"].resample("W").max(),
+        "low": d["low"].resample("W").min(),
+        "close": d["close"].resample("W").last()
+    }).dropna()
+    if len(wk) < 3: return None
+    prev = wk.iloc[-2]
+    tr = (wk["high"] - wk["low"]).rolling(14).mean()
+    atr_w = tr.iloc[-1]
+    est = atr_w if not np.isnan(atr_w) else (prev["high"] - prev["low"])
+    return {
+        "proj_hi": float(prev["close"] + est),
+        "proj_lo": float(prev["close"] - est),
+    }
+
+def _sr_top2(levels: dict) -> tuple[list[float], list[float]]:
+    """Return top two supports & resistances as floats (descending relevance)."""
+    s = [float(x[0]) for x in levels.get("support", [])[:2]]
+    r = [float(x[0]) for x in levels.get("resistance", [])[:2]]
+    # Pad to 2 for clean printing
+    while len(s) < 2: s.append(np.nan)
+    while len(r) < 2: r.append(np.nan)
+    return s, r
+
+def _fmt_sr_line(s: list[float], r: list[float]) -> str:
+    to2 = lambda v: ("—" if np.isnan(v) else f"{v:.2f}")
+    return f"S1 {to2(s[0])} · S2 {to2(s[1])}  |  R1 {to2(r[0])} · R2 {to2(r[1])}"

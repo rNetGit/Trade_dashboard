@@ -1,96 +1,110 @@
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
 
-import numpy as np, pandas as pd, plotly.graph_objects as go, streamlit as st
-from ta_utils import (calculate_rsi, calculate_ema, calculate_macd, calculate_vwap, calculate_atr, fused_levels, build_trade_plan)
+from ta_utils import (
+    calculate_rsi, calculate_ema, calculate_macd, calculate_vwap, calculate_atr,
+    fused_levels, build_trade_plan, resample_ohlcv,
+    project_day_range, project_week_range
+)
 
-st.set_page_config(page_title="SPX Dashboard", page_icon="📈", layout="wide")
-st.title("SPX Technical Dashboard — Enhanced")
+st.set_page_config(page_title="SPX 4H/1D", page_icon="📈", layout="wide")
+st.title("SPX — Day Trading (4H) & Swing (1D)")
 
 @st.cache_data(show_spinner=False)
 def load_data(path: str) -> pd.DataFrame:
-    df_ = pd.read_csv(path)
-    df_.columns = [c.strip().lower() for c in df_.columns]
-    if "date" not in df_.columns: raise ValueError("CSV must include a 'date' column")
-    df_["date"] = pd.to_datetime(df_["date"])
-    df_ = df_.sort_values("date").reset_index(drop=True)
-    for c in ["open","high","low","close"]:
-        if c not in df_.columns: df_[c] = df_["close"]
-    if "volume" not in df_.columns: df_["volume"] = np.nan
-    return df_
+    df = pd.read_csv(path)
+    df.columns = [c.strip().lower() for c in df.columns]
+    if "date" not in df.columns:
+        df["date"] = pd.to_datetime(df.iloc[:, 0], utc=True, errors="coerce").dt.tz_convert(None)
+    else:
+        df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce").dt.tz_convert(None)
+    df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
-# === Load data ===
-df = load_data("spx_data.csv")
+    for c in ["open", "high", "low", "close"]:
+        if c not in df.columns:
+            df[c] = df["close"]
+    if "volume" not in df.columns:
+        df["volume"] = np.nan
+    return df
 
-# === Compute indicators ===
-df["rsi"] = calculate_rsi(df["close"])
-df["ema20"] = calculate_ema(df["close"], 20)
-df["ema50"] = calculate_ema(df["close"], 50)
-df["vwap"]  = calculate_vwap(df)
-macd, macd_sig = calculate_macd(df["close"])
-df["macd"], df["macd_signal"] = macd, macd_sig
-df["atr"]  = calculate_atr(df)
+def enrich(df):
+    d = df.copy()
+    d["rsi"] = calculate_rsi(d["close"])
+    d["ema20"] = calculate_ema(d["close"], 20)
+    d["ema50"] = calculate_ema(d["close"], 50)
+    d["vwap"] = calculate_vwap(d)
+    macd, sig = calculate_macd(d["close"])
+    d["macd"], d["macd_signal"] = macd, sig
+    d["atr"] = calculate_atr(d)
+    return d
 
-# === Build trade plan & levels (now df exists) ===
-levels = fused_levels(df)
-plan = build_trade_plan(df)
-latest = df.iloc[-1]
+src = load_data("spx_data.csv")  # put your SPX CSV next to this script
 
-# === Compact trade plan summary just under title ===
-if plan['entry'] is not None:
-    st.markdown(f"**Entry:** {plan['entry']:.2f}  ·  **Stop:** {plan['stop']:.2f}  ·  **Targets:** {plan['targets'][0]:.2f} / {plan['targets'][1]:.2f}")
+# Build 4H and 1D frames
+df4h = enrich(resample_ohlcv(src, "4H"))
+df1d = enrich(resample_ohlcv(src, "1D"))
+
+# Plans & projections
+plan4 = build_trade_plan(df4h)
+planD = build_trade_plan(df1d)
+day_proj = project_day_range(df1d)
+week_proj = project_week_range(df1d)
+
+# Compact summaries
+if plan4['entry'] is not None:
+    st.markdown(f"**4H Day-Trade Plan** → Entry **{plan4['entry']:.2f}** · Stop **{plan4['stop']:.2f}** · Targets **{plan4['targets'][0]:.2f}/{plan4['targets'][1]:.2f}** · Bias **{plan4['bias']}**")
 else:
-    st.markdown("**Entry:** —  ·  **Stop:** —  ·  **Targets:** range play")
+    st.markdown("**4H Day-Trade Plan** → Range play (IC) · Bias **NEUTRAL**")
+if planD['entry'] is not None:
+    st.markdown(f"**1D Swing Plan** → Entry **{planD['entry']:.2f}** · Stop **{planD['stop']:.2f}** · Targets **{planD['targets'][0]:.2f}/{planD['targets'][1]:.2f}** · Bias **{planD['bias']}**")
+else:
+    st.markdown("**1D Swing Plan** → Range play (IC) · Bias **NEUTRAL**")
 
-# === Layout ===
-col1, col2, col3 = st.columns([1,2,1])
+c1, c2 = st.columns(2)
 
-with col1:
-    st.subheader("Market Bias & Plan")
-    st.markdown(f"**Bias:** {plan['bias']}")
-    st.markdown(f"**Strategy:** {plan['strategy']}")
-    st.markdown(f"**ATR(14):** {plan['atr']:.2f}")
-    if plan["entry"] is not None:
-        st.markdown(f"**Entry:** {plan['entry']:.2f}")
-        st.markdown(f"**Stop:** {plan['stop']:.2f}")
-        st.markdown(f"**Targets:** {plan['targets'][0]:.2f} / {plan['targets'][1]:.2f}")
-    else:
-        st.info("Range detected — fade extremes or use Iron Condor.")
+def last_n_days(df, days=5):
+    d = df.copy()
+    d["day"] = pd.to_datetime(d["date"]).dt.date
+    last_day = d["day"].iloc[-1]
+    cutoff = pd.Timestamp(last_day) - pd.Timedelta(days=days-1)
+    return d[pd.to_datetime(d["day"]) >= cutoff].copy()
 
-    st.subheader("Support (score)")
-    if levels["support"]:
-        for lv, sc in levels["support"]:
-            st.write(f"{lv:.2f}  (score {sc:.1f})")
-    else:
-        st.write("—")
-
-    st.subheader("Resistance (score)")
-    if levels["resistance"]:
-        for lv, sc in levels["resistance"]:
-            st.write(f"{lv:.2f}  (score {sc:.1f})")
-    else:
-        st.write("—")
-
-with col2:
-    st.subheader("Price Chart")
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df["date"], open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="Price"))
-    fig.add_trace(go.Scatter(x=df["date"], y=df["ema20"], name="EMA20", line=dict(dash="dot")))
-    fig.add_trace(go.Scatter(x=df["date"], y=df["ema50"], name="EMA50", line=dict(dash="dot")))
-    if not df["vwap"].isna().all():
-        fig.add_trace(go.Scatter(x=df["date"], y=df["vwap"], name="VWAP", line=dict(dash="dash")))
-
-    for lv,_ in levels["support"][:3]:
+def add_common_overlays(fig, d, lev, day_proj=None, week_proj=None):
+    fig.add_trace(go.Candlestick(
+        x=d["date"], open=d["open"], high=d["high"], low=d["low"], close=d["close"], name="Price"
+    ))
+    fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"], name="EMA20", line=dict(dash="dot")))
+    fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"], name="EMA50", line=dict(dash="dot")))
+    if not d["vwap"].isna().all():
+        fig.add_trace(go.Scatter(x=d["date"], y=d["vwap"], name="VWAP", line=dict(dash="dash")))
+    for lv, _ in lev["support"][:3]:
         fig.add_hline(y=float(lv), line_color="#17c964", opacity=0.6)
-    for lv,_ in levels["resistance"][:3]:
+    for lv, _ in lev["resistance"][:3]:
         fig.add_hline(y=float(lv), line_color="#f31260", opacity=0.6)
+    if day_proj:
+        fig.add_hrect(y0=day_proj["proj_lo"], y1=day_proj["proj_hi"],
+                      line_width=0, fillcolor="rgba(44,164,234,0.10)")
+    if week_proj:
+        fig.add_hrect(y0=week_proj["proj_lo"], y1=week_proj["proj_hi"],
+                      line_width=0, fillcolor="rgba(255,22,61,0.06)")
+    fig.update_layout(height=520, margin=dict(l=10, r=10, t=40, b=10),
+                      plot_bgcolor="#121620", paper_bgcolor="#121620",
+                      font=dict(color="#e8eef6"))
 
-    fig.update_layout(height=520, margin=dict(l=10,r=10,t=40,b=10), plot_bgcolor="#121620", paper_bgcolor="#121620", font=dict(color="#e8eef6"))
+with c1:
+    st.subheader("4H — Last 5 days")
+    d = last_n_days(df4h, 5)
+    lev = fused_levels(d)
+    fig = go.Figure()
+    add_common_overlays(fig, d, lev, day_proj=day_proj, week_proj=None)
     st.plotly_chart(fig, use_container_width=True)
 
-with col3:
-    st.subheader("Latest Indicators")
-    st.write(f"RSI(14): {float(latest['rsi']):.1f}")
-    st.write(f"MACD: {float(latest['macd']):.2f} vs {float(latest['macd_signal']):.2f}")
-    st.write(f"EMA20/50: {float(latest['ema20']):.2f} / {float(latest['ema50']):.2f}")
-    vw = latest['vwap']
-    st.write(f"VWAP: {'—' if np.isnan(vw) else f'{float(vw):.2f}'}")
-    st.write(f"ATR(14): {float(latest['atr']):.2f}")
+with c2:
+    st.subheader("1D — Last 5 days")
+    d = last_n_days(df1d, 5)
+    lev = fused_levels(d)
+    fig = go.Figure()
+    add_common_overlays(fig, d, lev, day_proj=day_proj, week_proj=week_proj)
+    st.plotly_chart(fig, use_container_width=True)
