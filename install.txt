@@ -1,0 +1,12 @@
+pip install -r requirements.txt
+pip install streamlit
+
+pip install plotly
+
+streamlit run tradeIt.py
+
+
+streamlit run tradeIt.py --server.enableCORS=false --server.enableXsrfProtection=false
+
+
+
