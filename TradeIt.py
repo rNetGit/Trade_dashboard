@@ -12,9 +12,8 @@ from ta_utils import (
 
 # ───────────────────────────── App chrome ─────────────────────────────
 st.set_page_config(page_title="TradeIt", page_icon="📈", layout="wide")
-st.title("✨ iTrader — 4H & Daily Analyzer")
+st.title("✨ TradeIt — 4H & Daily Analyzer")
 
-# Minimal high-contrast mobile-friendly CSS + nicer cards
 st.markdown("""
 <style>
 :root{
@@ -27,7 +26,7 @@ html,body,.stApp{background:#0e1118;color:var(--ink)}
   border-radius:18px; padding:14px 14px 10px; margin:10px 0;
   border:1px solid #2a2d3e; box-shadow:0 6px 16px rgba(0,0,0,.25);
 }
-.title{font-weight:800; letter-spacing:.2px; color:var(--accent); font-size:1.05rem}
+.title{font-weight:800; letter-spacing:.2px; color:#2ca4ea; font-size:1.05rem}
 .subtle{opacity:.9; font-size:.92rem}
 .rule{height:1px; background:linear-gradient(90deg, transparent, #30344a, transparent); margin:8px 0 10px}
 .badge{display:inline-block; padding:2px 9px; border-radius:999px; font-size:.78rem; font-weight:700}
@@ -47,12 +46,13 @@ small.dim{opacity:.7}
 </style>
 """, unsafe_allow_html=True)
 
-# ───────────────────────────── Helpers ─────────────────────────────
+# ───────────────────────────── Inputs ─────────────────────────────
 folder = st.sidebar.text_input(
     "CSV folder", ".",
     help="One CSV per symbol: date, open, high, low, close, volume(optional)"
 )
 
+# ───────────────────────────── Helpers ─────────────────────────────
 @st.cache_data(show_spinner=False)
 def _load_and_normalize_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -85,26 +85,14 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     d["atr"] = calculate_atr(d)
     return d
 
-def bias_row(row):
-    score = 0
-    if row["close"] > row["ema20"] > row["ema50"]: score += 2
-    if row["rsi"] >= 55: score += 1
-    if row["macd"] > row["macd_signal"] and row["macd"] > 0: score += 1
-    if not np.isnan(row["vwap"]) and row["close"] > row["vwap"]: score += 1
-    if score >= 3: return "BULLISH"
-    if score <= 1: return "BEARISH"
-    return "NEUTRAL"
-
 def structure_badge(bias: str) -> str:
     return ('<span class="badge bull">PCS</span>' if bias == "BULLISH"
             else '<span class="badge bear">CCS</span>' if bias == "BEARISH"
             else '<span class="badge neu">IC</span>')
 
 def _sr_top2(levels: dict) -> tuple[list[float], list[float]]:
-    """Return top two supports & resistances as floats (descending relevance)."""
     s = [float(x[0]) for x in levels.get("support", [])[:2]]
     r = [float(x[0]) for x in levels.get("resistance", [])[:2]]
-    # Pad to 2 for clean printing
     while len(s) < 2: s.append(np.nan)
     while len(r) < 2: r.append(np.nan)
     return s, r
@@ -113,7 +101,61 @@ def _fmt_sr_line(s: list[float], r: list[float]) -> str:
     to2 = lambda v: ("—" if np.isnan(v) else f"{v:.2f}")
     return f"S1 {to2(s[0])} · S2 {to2(s[1])}  |  R1 {to2(r[0])} · R2 {to2(r[1])}"
 
-# ───────────────────────────── Load data ─────────────────────────────
+def last_n_days(df: pd.DataFrame, days: int = 30) -> pd.DataFrame:
+    d = df.copy()
+    d["date"] = pd.to_datetime(d["date"])
+    cutoff = d["date"].max().normalize() - pd.Timedelta(days=days-1)
+    return d[d["date"] >= cutoff].copy()
+
+def add_common_overlays(fig, d, lev, day_proj=None, week_proj=None):
+    # Price + MAs + VWAP
+    fig.add_trace(go.Candlestick(
+        x=d["date"], open=d["open"], high=d["high"], low=d["low"], close=d["close"],
+        name="Price",
+        increasing_line_color="#17c964", decreasing_line_color="#f31260"
+    ))
+    fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"], name="EMA20", line=dict(dash="dot")))
+    fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"], name="EMA50", line=dict(dash="dot")))
+    if not d["vwap"].isna().all():
+        fig.add_trace(go.Scatter(x=d["date"], y=d["vwap"], name="VWAP", line=dict(dash="dash")))
+
+    # S/R lines
+    for lv, _ in lev.get("support", [])[:3]:
+        fig.add_hline(y=float(lv), line_color="#17c964", opacity=0.6)
+    for lv, _ in lev.get("resistance", [])[:3]:
+        fig.add_hline(y=float(lv), line_color="#f31260", opacity=0.6)
+
+    # S/R labels
+    for idx, (lv, _w) in enumerate(lev.get("support", [])[:2], start=1):
+        fig.add_annotation(x=d["date"].iloc[-1], y=float(lv),
+                           text=f"S{idx}", showarrow=False,
+                           font=dict(color="#17c964", size=10),
+                           bgcolor="rgba(23,201,100,0.12)", bordercolor="#17c964",
+                           borderwidth=1, xanchor="right", yanchor="bottom")
+    for idx, (lv, _w) in enumerate(lev.get("resistance", [])[:2], start=1):
+        fig.add_annotation(x=d["date"].iloc[-1], y=float(lv),
+                           text=f"R{idx}", showarrow=False,
+                           font=dict(color="#f31260", size=10),
+                           bgcolor="rgba(243,18,96,0.10)", bordercolor="#f31260",
+                           borderwidth=1, xanchor="right", yanchor="top")
+
+    # Projection bands
+    if day_proj:
+        fig.add_hrect(y0=day_proj["proj_lo"], y1=day_proj["proj_hi"], line_width=0,
+                      fillcolor="rgba(44,164,234,0.10)")
+    if week_proj:
+        fig.add_hrect(y0=week_proj["proj_lo"], y1=week_proj["proj_hi"], line_width=0,
+                      fillcolor="rgba(255,22,61,0.06)")
+
+    # Y zoom & theme
+    ymin, ymax = d["low"].min(), d["high"].max()
+    pad = (ymax - ymin) * 0.03 if ymax > ymin else max(1.0, ymin * 0.01)
+    fig.update_yaxes(range=[ymin - pad, ymax + pad])
+    fig.update_layout(height=520, margin=dict(l=10,r=10,t=40,b=10),
+                      plot_bgcolor="#121620", paper_bgcolor="#121620",
+                      font=dict(color="#e8eef6"))
+
+# ───────────────────────────── Data ─────────────────────────────
 files = sorted(glob.glob(os.path.join(folder, "*.csv")))
 symbols = {}
 for p in files:
@@ -127,8 +169,64 @@ if not symbols:
     st.warning("No CSVs found. Point 'CSV folder' to your data directory.")
     st.stop()
 
+# ───────────────────────────── Modal (Streamlit dialog) ─────────────────────────────
+# Support both new and old Streamlit versions.
+def open_details_dialog(sym: str):
+    if hasattr(st, "dialog"):
+        @st.dialog(f"🔍 {sym} — Details", width="large")
+        def _dlg():
+            src = symbols[sym]
+            df4h = enrich(resample_ohlcv(src, "4H"))
+            dfd  = enrich(resample_ohlcv(src, "1D"))
+            day_proj  = project_day_range(dfd)
+            week_proj = project_week_range(dfd)
+
+            tab4, tabD = st.tabs(["4H (Day Trading)", "1D (Swing)"])
+            with tab4:
+                d = last_n_days(df4h, 15)
+                lev = fused_levels(d)
+                fig = go.Figure()
+                add_common_overlays(fig, d, lev, day_proj=day_proj)
+                st.plotly_chart(fig, use_container_width=True)
+            with tabD:
+                d = last_n_days(dfd, 30)
+                lev = fused_levels(d)
+                fig = go.Figure()
+                add_common_overlays(fig, d, lev, day_proj=day_proj, week_proj=week_proj)
+                st.plotly_chart(fig, use_container_width=True)
+
+            if st.button("✖ Close"):
+                st.rerun()
+        _dlg()
+    else:
+        @st.experimental_dialog(f"🔍 {sym} — Details")
+        def _dlg_exp():
+            src = symbols[sym]
+            df4h = enrich(resample_ohlcv(src, "4H"))
+            dfd  = enrich(resample_ohlcv(src, "1D"))
+            day_proj  = project_day_range(dfd)
+            week_proj = project_week_range(dfd)
+
+            tab4, tabD = st.tabs(["4H (Day Trading)", "1D (Swing)"])
+            with tab4:
+                d = last_n_days(df4h, 15)
+                lev = fused_levels(d)
+                fig = go.Figure()
+                add_common_overlays(fig, d, lev, day_proj=day_proj)
+                st.plotly_chart(fig, use_container_width=True)
+            with tabD:
+                d = last_n_days(dfd, 30)
+                lev = fused_levels(d)
+                fig = go.Figure()
+                add_common_overlays(fig, d, lev, day_proj=day_proj, week_proj=week_proj)
+                st.plotly_chart(fig, use_container_width=True)
+
+            if st.button("✖ Close"):
+                st.rerun()
+        _dlg_exp()
+
 # ───────────────────────────── Overview cards ─────────────────────────────
-st.subheader("Overview (4H/1D Analyzer)")
+st.subheader("Overview (4H Day-Trade & 1D Swing)")
 
 cols_per_row = 3
 syms = list(symbols.keys())
@@ -140,7 +238,7 @@ for i in range(0, len(syms), cols_per_row):
         df4h = enrich(resample_ohlcv(src, "4H"))
         dfd  = enrich(resample_ohlcv(src, "1D"))
 
-        # Compute S/R for chips
+        # S/R chips
         lev4 = fused_levels(df4h.tail(120))
         levD = fused_levels(dfd.tail(180))
         s4, r4 = _sr_top2(lev4)
@@ -202,92 +300,6 @@ for i in range(0, len(syms), cols_per_row):
                 st.write("<small class='dim'>Range play (IC)</small>", unsafe_allow_html=True)
 
             if st.button("View details", key=f"btn_{sym}"):
-                st.session_state["detail"] = sym
+                open_details_dialog(sym)
 
             st.markdown('</div>', unsafe_allow_html=True)
-
-# ───────────────────────────── Details view ─────────────────────────────
-def last_n_days(df: pd.DataFrame, days: int = 30) -> pd.DataFrame:
-    d = df.copy()
-    d["date"] = pd.to_datetime(d["date"])
-    cutoff = d["date"].max().normalize() - pd.Timedelta(days=days-1)
-    return d[d["date"] >= cutoff].copy()
-
-def add_common_overlays(fig, d, lev, day_proj=None, week_proj=None):
-    # Price + MAs + VWAP
-    fig.add_trace(go.Candlestick(
-        x=d["date"], open=d["open"], high=d["high"], low=d["low"], close=d["close"],
-        name="Price",
-        increasing_line_color="#17c964", decreasing_line_color="#f31260"
-    ))
-    fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"], name="EMA20", line=dict(dash="dot")))
-    fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"], name="EMA50", line=dict(dash="dot")))
-    if not d["vwap"].isna().all():
-        fig.add_trace(go.Scatter(x=d["date"], y=d["vwap"], name="VWAP", line=dict(dash="dash")))
-
-    # Draw support/resistance lines
-    for lv, _ in lev["support"][:3]:
-        fig.add_hline(y=float(lv), line_color="#17c964", opacity=0.6)
-    for lv, _ in lev["resistance"][:3]:
-        fig.add_hline(y=float(lv), line_color="#f31260", opacity=0.6)
-
-    # Label first two S/R on the right edge
-    for idx, (lv, _w) in enumerate(lev["support"][:2], start=1):
-        fig.add_annotation(x=d["date"].iloc[-1], y=float(lv),
-                           text=f"S{idx}", showarrow=False,
-                           font=dict(color="#17c964", size=10),
-                           bgcolor="rgba(23,201,100,0.12)", bordercolor="#17c964",
-                           borderwidth=1, xanchor="right", yanchor="bottom")
-    for idx, (lv, _w) in enumerate(lev["resistance"][:2], start=1):
-        fig.add_annotation(x=d["date"].iloc[-1], y=float(lv),
-                           text=f"R{idx}", showarrow=False,
-                           font=dict(color="#f31260", size=10),
-                           bgcolor="rgba(243,18,96,0.10)", bordercolor="#f31260",
-                           borderwidth=1, xanchor="right", yanchor="top")
-
-    # Projection bands
-    if day_proj:
-        fig.add_hrect(y0=day_proj["proj_lo"], y1=day_proj["proj_hi"], line_width=0,
-                      fillcolor="rgba(44,164,234,0.10)")
-    if week_proj:
-        fig.add_hrect(y0=week_proj["proj_lo"], y1=week_proj["proj_hi"], line_width=0,
-                      fillcolor="rgba(255,22,61,0.06)")
-
-    # Y zoom & theme
-    ymin, ymax = d["low"].min(), d["high"].max()
-    pad = (ymax - ymin) * 0.03 if ymax > ymin else max(1.0, ymin * 0.01)
-    fig.update_yaxes(range=[ymin - pad, ymax + pad])
-
-    fig.update_layout(height=520, margin=dict(l=10,r=10,t=40,b=10),
-                      plot_bgcolor="#121620", paper_bgcolor="#121620",
-                      font=dict(color="#e8eef6"))
-
-# Render details when selected
-if "detail" in st.session_state and st.session_state["detail"]:
-    sym = st.session_state["detail"]
-    src = symbols[sym]
-    df4h = enrich(resample_ohlcv(src, "4H"))
-    dfd  = enrich(resample_ohlcv(src, "1D"))
-    st.markdown("---")
-    st.header(f"🔍 Details — {sym}")
-
-    day_proj  = project_day_range(dfd)
-    week_proj = project_week_range(dfd)
-
-    tab4, tabD = st.tabs(["4H (Day Trading)", "1D (Swing)"])
-
-    with tab4:
-        st.subheader("4H — Last 15 days")
-        d = last_n_days(df4h, 15)
-        lev = fused_levels(d)
-        fig = go.Figure()
-        add_common_overlays(fig, d, lev, day_proj=day_proj, week_proj=None)
-        st.plotly_chart(fig, use_container_width=True)
-
-    with tabD:
-        st.subheader("1D — Last 30 days")
-        d = last_n_days(dfd, 30)
-        lev = fused_levels(d)
-        fig = go.Figure()
-        add_common_overlays(fig, d, lev, day_proj=day_proj, week_proj=week_proj)
-        st.plotly_chart(fig, use_container_width=True)
