@@ -3,16 +3,9 @@ import pandas as pd
 
 # ---------------- Helpers ----------------
 
-
 def _to_naive_utc_index(series: pd.Series) -> pd.DatetimeIndex:
-    """
-    Parse any mix of tz-aware/naive strings to UTC, then drop tz to get a naive DatetimeIndex.
-    Non-parsable rows become NaT (we drop them later).
-    """
-    # Parse to UTC first (handles tz-aware and naive inputs)
-    s = pd.to_datetime(series, utc=True, errors="coerce")     # -> Series[datetime64[ns, UTC]]
-    # Convert to a DatetimeIndex, then drop timezone to make it naive
-    idx = pd.DatetimeIndex(s).tz_convert(None)                # -> DatetimeIndex[datetime64[ns]]
+    s = pd.to_datetime(series, utc=True, errors="coerce")
+    idx = pd.DatetimeIndex(s).tz_convert(None)
     return idx
 
 # ---------------- Core Indicators ----------------
@@ -210,10 +203,8 @@ def project_week_range(df_day: pd.DataFrame):
     }
 
 def _sr_top2(levels: dict) -> tuple[list[float], list[float]]:
-    """Return top two supports & resistances as floats (descending relevance)."""
     s = [float(x[0]) for x in levels.get("support", [])[:2]]
     r = [float(x[0]) for x in levels.get("resistance", [])[:2]]
-    # Pad to 2 for clean printing
     while len(s) < 2: s.append(np.nan)
     while len(r) < 2: r.append(np.nan)
     return s, r
@@ -221,3 +212,28 @@ def _sr_top2(levels: dict) -> tuple[list[float], list[float]]:
 def _fmt_sr_line(s: list[float], r: list[float]) -> str:
     to2 = lambda v: ("—" if np.isnan(v) else f"{v:.2f}")
     return f"S1 {to2(s[0])} · S2 {to2(s[1])}  |  R1 {to2(r[0])} · R2 {to2(r[1])}"
+
+# Extra indicators
+def calculate_bbands(prices: pd.Series, window: int = 20, mult: float = 2.0):
+    ma = prices.rolling(window).mean()
+    sd = prices.rolling(window).std(ddof=0)
+    upper = ma + mult * sd
+    lower = ma - mult * sd
+    return upper, ma, lower
+
+def calculate_adx(df: pd.DataFrame, window: int = 14) -> pd.Series:
+    # Wilder’s ADX (simplified)
+    h, l, c = df["high"], df["low"], df["close"]
+    up = h.diff()
+    down = -l.diff()
+    plus_dm  = ((up > down) & (up > 0)).astype(float) * up
+    minus_dm = ((down > up) & (down > 0)).astype(float) * down
+
+    tr = (h.combine(c.shift(), max) - l.combine(c.shift(), min)).abs()
+    tr = tr.rolling(window).sum()
+
+    plus_di  = 100 * (plus_dm.rolling(window).sum() / tr)
+    minus_di = 100 * (minus_dm.rolling(window).sum() / tr)
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)) * 100
+    adx = dx.rolling(window).mean()
+    return adx
