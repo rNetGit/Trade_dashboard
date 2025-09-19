@@ -342,6 +342,99 @@ def make_chart(d: pd.DataFrame, title: str, height: int = 560,
     return fig
 
 # =========================
+# Trade Levels (Entry/Stop/Targets)
+# =========================
+def compute_trade_levels(df: pd.DataFrame, plan: dict, rr: float = 1.5,
+                         stop_mult: float = 0.8, t1_mult: float = 0.5,
+                         t2_mult: float = 1.0, t3_mult: float = 1.5):
+    """
+    Computes simple ATR-based levels.
+    - Direction chooses long for BULLISH, short for BEARISH; for NEUTRAL returns both.
+    - Entry: last close
+    - Stop: ATR * stop_mult away in opposite direction
+    - Targets: ATR * [t1,t2,t3] in direction
+    """
+    last = df.iloc[-1]
+    entry = float(last['close'])
+    atr = float(plan['atr'])
+    bias = plan['bias'] or 'NEUTRAL'
+
+    def _dir_levels(direction: str):
+        sign = 1 if direction == 'long' else -1
+        stop = entry - sign * atr * stop_mult
+        t1 = entry + sign * atr * t1_mult
+        t2 = entry + sign * atr * t2_mult
+        t3 = entry + sign * atr * t3_mult
+        return {'direction': direction, 'entry': entry, 'stop': stop, 't1': t1, 't2': t2, 't3': t3}
+
+    if bias == 'BULLISH':
+        return {'primary': _dir_levels('long')}
+    if bias == 'BEARISH':
+        return {'primary': _dir_levels('short')}
+    # Neutral → show both
+    return {'long': _dir_levels('long'), 'short': _dir_levels('short')}
+
+def add_levels_to_figure(fig: go.Figure, levels: dict, yaxis='y1'):
+    """
+    Draws horizontal lines for Entry/Stop/T1/T2/T3. No text annotation; we'll show
+    levels inline above the chart for clarity.
+    """
+    def _draw_set(lv: dict, color='#31c48d'):
+        fig.add_hline(y=lv['stop'], line=dict(width=1, dash='dot', color=color))
+        fig.add_hline(y=lv['t1'],   line=dict(width=1, dash='solid', color=color))
+        fig.add_hline(y=lv['t2'],   line=dict(width=1, dash='dash', color=color))
+        fig.add_hline(y=lv['t3'],   line=dict(width=1, dash='dashdot', color=color))
+        fig.add_hline(y=lv['entry'], line=dict(width=2, color=color))
+    if not levels:
+        return fig
+    if 'primary' in levels:
+        _draw_set(levels['primary'], color='#36d399')
+    else:
+        _draw_set(levels['long'], color='#36d399')
+        _draw_set(levels['short'], color='#f87272')
+    return fig
+    if 'primary' in levels:
+        _draw_set('Primary', levels['primary'], color='#36d399')
+    else:
+        _draw_set('Long', levels['long'], color='#36d399')
+        _draw_set('Short', levels['short'], color='#f87272')
+    return fig
+
+
+# =========================
+# Header formatting helpers
+# =========================
+
+def _fmt(v: float) -> str:
+    # compact number formatting
+    return f"{v:.1f}"
+
+def header_levels_md(symbol: str, tf_label: str, lv_dict: dict) -> str:
+    def block(label: str, lv: dict, cls: str) -> str:
+        return (f"<span class='pill {cls}'>{label}</span> "
+                f"E:{_fmt(lv['entry'])} · S:{_fmt(lv['stop'])} · "
+                f"T1:{_fmt(lv['t1'])} · T2:{_fmt(lv['t2'])} · T3:{_fmt(lv['t3'])}")
+    if not lv_dict: 
+        return f"<h3>{symbol} — {tf_label}</h3>"
+    if 'primary' in lv_dict:
+        lbl = 'LONG' if lv_dict['primary']['direction']=='long' else 'SHORT'
+        html = f"<h3>{symbol} — {tf_label} · " + block(lbl, lv_dict['primary'], 'ok') + "</h3>"
+    else:
+        html = (f"<h3>{symbol} — {tf_label} · " 
+                + block('LONG', lv_dict['long'], 'ok') + " · "
+                + block('SHORT', lv_dict['short'], 'warn') + "</h3>")
+    style = """
+    <style>
+    h3 { margin: 0.2rem 0 0.6rem; }
+    .pill { padding: 2px 8px; border-radius: 9999px; font-weight: 600; }
+    .ok { background: rgba(54,211,153,0.15); border:1px solid rgba(54,211,153,0.4); }
+    .warn { background: rgba(248,114,114,0.15); border:1px solid rgba(248,114,114,0.4); }
+    h3, .pill { font-size: 1.1rem; }
+    @media (max-width: 900px) { h3, .pill { font-size: 0.95rem; } }
+    </style>
+    """
+    return style + html
+# =========================
 # Streamlit UI
 # =========================
 st.markdown("<h4>iTrader - Technical Analysis</h4>", unsafe_allow_html=True)
@@ -350,6 +443,11 @@ st.markdown("<h4>iTrader - Technical Analysis</h4>", unsafe_allow_html=True)
 data_folder = st.sidebar.text_input("Folder with CSVs", value=".", help="Folder with SPX.csv (+ ES1.csv optional)")
 show_bbands = st.sidebar.checkbox("Bollinger Bands", True)
 show_vol    = st.sidebar.checkbox("Volume panel", True)
+show_levels = st.sidebar.checkbox("Show Entry/Stop/Targets", True)
+stop_mult = st.sidebar.slider("Stop (×ATR)", 0.3, 2.0, 0.8, 0.05)
+t1_mult = st.sidebar.slider("T1 (×ATR)", 0.3, 2.5, 0.5, 0.05)
+t2_mult = st.sidebar.slider("T2 (×ATR)", 0.5, 3.0, 1.0, 0.05)
+t3_mult = st.sidebar.slider("T3 (×ATR)", 0.5, 4.0, 1.5, 0.05)
 spike_z     = st.sidebar.slider("Spike Z-score", 1.5, 4.0, 2.0, 0.1)
 days_1h     = st.sidebar.slider("Days (1H)", 5, 90, 30)
 days_4h     = st.sidebar.slider("Days (4H)", 5, 60, 15)
@@ -434,12 +532,71 @@ if alert_1h:
 
 # Tabs with charts
 tab1, tab2, tab3 = st.tabs(["1H", "4H", "1D"])
+
 with tab1:
-    st.plotly_chart(make_chart(d1h_view, f"{symbol} — 1H", height=560, show_bbands=show_bbands, show_vol=show_vol),
-                    use_container_width=True)
+    lv1 = compute_trade_levels(d1h_view, plan_1h, stop_mult=stop_mult,
+                               t1_mult=t1_mult, t2_mult=t2_mult, t3_mult=t3_mult)
+    st.markdown(f"### {symbol} — 1H")
+    if lv1:
+        if 'primary' in lv1:
+            lv = lv1['primary']
+            st.caption(f"**{lv['direction'].upper()}** · E:{lv['entry']:.1f} · S:{lv['stop']:.1f} · "
+                       f"T1:{lv['t1']:.1f} · T2:{lv['t2']:.1f} · T3:{lv['t3']:.1f}")
+        else:
+            st.caption(f"**LONG** · E:{lv1['long']['entry']:.1f} · S:{lv1['long']['stop']:.1f} · "
+                       f"T1:{lv1['long']['t1']:.1f} · T2:{lv1['long']['t2']:.1f} · T3:{lv1['long']['t3']:.1f}")
+            st.caption(f"**SHORT** · E:{lv1['short']['entry']:.1f} · S:{lv1['short']['stop']:.1f} · "
+                       f"T1:{lv1['short']['t1']:.1f} · T2:{lv1['short']['t2']:.1f} · T3:{lv1['short']['t3']:.1f}")
+
+    fig1 = make_chart(d1h_view, f"{symbol} — 1H", height=560,
+                      show_bbands=show_bbands, show_vol=show_vol)
+    if show_levels:
+        fig1 = add_levels_to_figure(fig1, lv1)
+    st.plotly_chart(fig1, use_container_width=True)
+
+
 with tab2:
-    st.plotly_chart(make_chart(d4h_view, f"{symbol} — 4H", height=520, show_bbands=show_bbands, show_vol=show_vol),
-                    use_container_width=True)
+    plan_4h = build_trade_plan(d4h_view)
+    lv2 = compute_trade_levels(d4h_view, plan_4h, stop_mult=stop_mult,
+                               t1_mult=t1_mult, t2_mult=t2_mult, t3_mult=t3_mult)
+    st.markdown(f"### {symbol} — 4H")
+    if lv2:
+        if 'primary' in lv2:
+            lv = lv2['primary']
+            st.caption(f"**{lv['direction'].upper()}** · E:{lv['entry']:.1f} · S:{lv['stop']:.1f} · "
+                       f"T1:{lv['t1']:.1f} · T2:{lv['t2']:.1f} · T3:{lv['t3']:.1f}")
+        else:
+            st.caption(f"**LONG** · E:{lv2['long']['entry']:.1f} · S:{lv2['long']['stop']:.1f} · "
+                       f"T1:{lv2['long']['t1']:.1f} · T2:{lv2['long']['t2']:.1f} · T3:{lv2['long']['t3']:.1f}")
+            st.caption(f"**SHORT** · E:{lv2['short']['entry']:.1f} · S:{lv2['short']['stop']:.1f} · "
+                       f"T1:{lv2['short']['t1']:.1f} · T2:{lv2['short']['t2']:.1f} · T3:{lv2['short']['t3']:.1f}")
+
+    fig2 = make_chart(d4h_view, f"{symbol} — 4H", height=520,
+                      show_bbands=show_bbands, show_vol=show_vol)
+    if show_levels:
+        fig2 = add_levels_to_figure(fig2, lv2)
+    st.plotly_chart(fig2, use_container_width=True)
+
+
 with tab3:
-    st.plotly_chart(make_chart(d1d_view, f"{symbol} — 1D", height=520, show_bbands=show_bbands, show_vol=show_vol),
-                    use_container_width=True)
+    plan_1d = build_trade_plan(d1d_view)
+    lv3 = compute_trade_levels(d1d_view, plan_1d, stop_mult=stop_mult,
+                               t1_mult=t1_mult, t2_mult=t2_mult, t3_mult=t3_mult)
+    st.markdown(f"### {symbol} — 1D")
+    if lv3:
+        if 'primary' in lv3:
+            lv = lv3['primary']
+            st.caption(f"**{lv['direction'].upper()}** · E:{lv['entry']:.1f} · S:{lv['stop']:.1f} · "
+                       f"T1:{lv['t1']:.1f} · T2:{lv['t2']:.1f} · T3:{lv['t3']:.1f}")
+        else:
+            st.caption(f"**LONG** · E:{lv3['long']['entry']:.1f} · S:{lv3['long']['stop']:.1f} · "
+                       f"T1:{lv3['long']['t1']:.1f} · T2:{lv3['long']['t2']:.1f} · T3:{lv3['long']['t3']:.1f}")
+            st.caption(f"**SHORT** · E:{lv3['short']['entry']:.1f} · S:{lv3['short']['stop']:.1f} · "
+                       f"T1:{lv3['short']['t1']:.1f} · T2:{lv3['short']['t2']:.1f} · T3:{lv3['short']['t3']:.1f}")
+
+    fig3 = make_chart(d1d_view, f"{symbol} — 1D", height=520,
+                      show_bbands=show_bbands, show_vol=show_vol)
+    if show_levels:
+        fig3 = add_levels_to_figure(fig3, lv3)
+    st.plotly_chart(fig3, use_container_width=True)
+
