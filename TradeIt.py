@@ -536,7 +536,7 @@ tab1, tab2, tab3 = st.tabs(["1H", "4H", "1D"])
 with tab1:
     lv1 = compute_trade_levels(d1h_view, plan_1h, stop_mult=stop_mult,
                                t1_mult=t1_mult, t2_mult=t2_mult, t3_mult=t3_mult)
-    st.markdown(f"### {symbol} — 1H")
+  #  st.markdown(f"### {symbol} — 1H")
     if lv1:
         if 'primary' in lv1:
             lv = lv1['primary']
@@ -559,7 +559,7 @@ with tab2:
     plan_4h = build_trade_plan(d4h_view)
     lv2 = compute_trade_levels(d4h_view, plan_4h, stop_mult=stop_mult,
                                t1_mult=t1_mult, t2_mult=t2_mult, t3_mult=t3_mult)
-    st.markdown(f"### {symbol} — 4H")
+    #st.markdown(f"### {symbol} — 4H")
     if lv2:
         if 'primary' in lv2:
             lv = lv2['primary']
@@ -582,7 +582,7 @@ with tab3:
     plan_1d = build_trade_plan(d1d_view)
     lv3 = compute_trade_levels(d1d_view, plan_1d, stop_mult=stop_mult,
                                t1_mult=t1_mult, t2_mult=t2_mult, t3_mult=t3_mult)
-    st.markdown(f"### {symbol} — 1D")
+   # st.markdown(f"### {symbol} — 1D")
     if lv3:
         if 'primary' in lv3:
             lv = lv3['primary']
