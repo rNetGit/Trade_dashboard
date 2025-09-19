@@ -1,34 +1,42 @@
+# iTrader_merged.py
+# Streamlit dashboard for SPX/ES/etc technical analysis with credit-spread helpers.
+
 import os, glob
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# ───────────────────────────── Utilities ─────────────────────────────
-def _to_index(series: pd.Series) -> pd.DatetimeIndex:
+# ------------------------------------------------------------
+# Streamlit config MUST be first before any st.* calls
+# ------------------------------------------------------------
+st.set_page_config(page_title="iTrader (Merged)", page_icon="📈", layout="wide")
+
+# =========================
+# Core helpers & indicators
+# =========================
+def _to_naive_utc_index(series: pd.Series) -> pd.DatetimeIndex:
     s = pd.to_datetime(series, utc=True, errors="coerce")
     return pd.DatetimeIndex(s).tz_convert(None)
 
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     d = df.copy()
-    idx = _to_index(d["date"])
-    mask = ~idx.isna()
-    d = d.loc[mask].copy()
-    idx = idx[mask]
-    d.index = idx
+    idx = _to_naive_utc_index(d["date"])
+    d = d.loc[~idx.isna()].copy()
+    d.index = idx[~idx.isna()]
     d = d.sort_index()
+
     for c in ["open","high","low","close"]:
         if c not in d.columns:
             d[c] = d["close"]
+
     o = d["open"].resample(rule).first()
     h = d["high"].resample(rule).max()
     l = d["low"].resample(rule).min()
     c = d["close"].resample(rule).last()
+    out = pd.DataFrame({"date": o.index, "open": o.values, "high": h.values, "low": l.values, "close": c.values})
     if "volume" in d.columns:
-        v = d["volume"].resample(rule).sum()
-        out = pd.DataFrame({"date":o.index,"open":o.values,"high":h.values,"low":l.values,"close":c.values,"volume":v.values})
-    else:
-        out = pd.DataFrame({"date":o.index,"open":o.values,"high":h.values,"low":l.values,"close":c.values})
+        out["volume"] = d["volume"].resample(rule).sum().values
     return out.dropna().reset_index(drop=True)
 
 def calculate_rsi(prices: pd.Series, window: int = 14) -> pd.Series:
@@ -43,9 +51,16 @@ def calculate_rsi(prices: pd.Series, window: int = 14) -> pd.Series:
 def calculate_ema(prices: pd.Series, window: int) -> pd.Series:
     return prices.ewm(span=window, adjust=False).mean()
 
+def calculate_macd(prices: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast = calculate_ema(prices, fast)
+    ema_slow = calculate_ema(prices, slow)
+    macd = ema_fast - ema_slow
+    signal_line = calculate_ema(macd, signal)
+    return macd, signal_line
+
 def calculate_vwap(df: pd.DataFrame) -> pd.Series:
     if "volume" not in df.columns or df["volume"].isna().all():
-        return pd.Series(np.nan, index=df.index)
+        return pd.Series(np.nan, index=df.index if df.index.size else range(len(df)))
     tp = df["close"]
     pv = tp * df["volume"]
     return pv.cumsum() / df["volume"].cumsum()
@@ -59,7 +74,7 @@ def calculate_atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
 def calculate_bbands(prices: pd.Series, window: int = 20, mult: float = 2.0):
     ma = prices.rolling(window).mean()
     sd = prices.rolling(window).std(ddof=0)
-    return ma + mult*sd, ma, ma - mult*sd
+    return ma + mult * sd, ma, ma - mult * sd
 
 def calculate_adx(df: pd.DataFrame, window: int = 14) -> pd.Series:
     h, l, c = df["high"], df["low"], df["close"]
@@ -73,130 +88,177 @@ def calculate_adx(df: pd.DataFrame, window: int = 14) -> pd.Series:
     dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)) * 100
     return dx.rolling(window).mean()
 
-def fused_levels(df: pd.DataFrame, lookbacks=(5,10,20)):
+# =========================
+# S/R + trade plan + strikes
+# =========================
+def _pivot_points(df: pd.DataFrame):
+    prev = df.shift(1)
+    P = (prev["high"] + prev["low"] + prev["close"]) / 3.0
+    R1 = 2 * P - prev["low"]; S1 = 2 * P - prev["high"]
+    R2 = P + (prev["high"] - prev["low"]); S2 = P - (prev["high"] - prev["low"])
+    return P, R1, S1, R2, S2
+
+def _donchian(df: pd.DataFrame, n: int = 20):
+    upper = df["high"].rolling(n).max()
+    lower = df["low"].rolling(n).min()
+    mid = (upper + lower) / 2.0
+    return upper, lower, mid
+
+def _fractals(df: pd.DataFrame, left: int = 2, right: int = 2):
+    h, l = df["high"], df["low"]
+    sh = h[(h.shift(1).rolling(left).max() < h) & (h.shift(-1).rolling(right).max() < h)]
+    sl = l[(l.shift(1).rolling(left).min() > l) & (l.shift(-1).rolling(right).min() > l)]
+    return sh.dropna(), sl.dropna()
+
+def _round_levels(price: float, steps=(5, 10, 25, 50, 100)):
+    s = set()
+    for step in steps:
+        s.add(round(price / step) * step)
+        s.add(round((price + step / 2) / step) * step)
+        s.add(round((price - step / 2) / step) * step)
+    return sorted(s)
+
+def fused_levels(df: pd.DataFrame, lookbacks=(5, 10, 20)):
     price = float(df["close"].iloc[-1])
     levels = []
     for n in lookbacks:
         levels.append((float(df["high"].rolling(n).max().iloc[-1]), "R"))
         levels.append((float(df["low"].rolling(n).min().iloc[-1]), "S"))
-    supports, resistances = [], []
+    du, dl, _ = _donchian(df, n=max(lookbacks))
+    if not np.isnan(du.iloc[-1]):
+        levels.append((float(du.iloc[-1]), "R"))
+        levels.append((float(dl.iloc[-1]), "S"))
+    P, R1, S1, R2, S2 = _pivot_points(df)
+    for v, t in [(R1.iloc[-1], "R"), (S1.iloc[-1], "S"), (R2.iloc[-1], "R"), (S2.iloc[-1], "S"), (P.iloc[-1], "M")]:
+        if not np.isnan(v): levels.append((float(v), t))
+    sh, sl = _fractals(df)
+    levels += [(float(v), "R") for v in sh.tail(6).values]
+    levels += [(float(v), "S") for v in sl.tail(6).values]
+
+    tol = max(0.002 * price, df["close"].diff().abs().tail(50).mean() or 1.0)
+    buckets = []
     for lv, tag in levels:
-        (supports if lv <= price else resistances).append((lv, 1))
-    supports = sorted(supports, key=lambda x: (abs(price - x[0])))[:3]
-    resistances = sorted(resistances, key=lambda x: (abs(x[0] - price)))[:3]
+        placed = False
+        for b in buckets:
+            if abs(b["level"] - lv) <= tol:
+                b["cnt"] += 1; b["tags"].add(tag)
+                b["level"] = (b["level"] * b["w"] + lv) / (b["w"] + 1)
+                b["w"] += 1; placed = True; break
+        if not placed:
+            buckets.append({"level": lv, "cnt": 1, "tags": set([tag]), "w": 1})
+
+    supports, resistances = [], []
+    for b in buckets:
+        level = float(b["level"]); score = b["cnt"]
+        if "S" in b["tags"] and "R" in b["tags"]: score += 1
+        if any(abs(level - rn) <= tol for rn in _round_levels(price)): score += 0.5
+        (supports if level <= price else resistances).append((level, score))
+
+    supports = sorted(supports, key=lambda x: (abs(price - x[0]), -x[1]))[:5]
+    resistances = sorted(resistances, key=lambda x: (abs(x[0] - price), -x[1]))[:5]
     return {"support": supports, "resistance": resistances}
+
+def classify_trend(close: pd.Series, ema20: pd.Series, ema50: pd.Series) -> str:
+    price = float(close.iloc[-1]); e20 = float(ema20.iloc[-1]); e50 = float(ema50.iloc[-1])
+    if price > e20 > e50: return "up"
+    if price < e20 < e50: return "down"
+    return "sideways"
 
 def build_trade_plan(df: pd.DataFrame):
     price = float(df["close"].iloc[-1])
-    atr = calculate_atr(df).iloc[-1]
-    atr = float(atr) if not np.isnan(atr) else max(1.0, price*0.005)
+    _atr = calculate_atr(df).iloc[-1]
+    _atr = float(_atr) if not np.isnan(_atr) else max(1.0, price * 0.005)
+    ema20 = calculate_ema(df["close"], 20); ema50 = calculate_ema(df["close"], 50)
+    adx = calculate_adx(df)
     levels = fused_levels(df)
-    e20, e50 = calculate_ema(df["close"],20), calculate_ema(df["close"],50)
-    if price > e20.iloc[-1] > e50.iloc[-1]:
-        bias = "BULLISH"
-        res = levels["resistance"][0][0] if levels["resistance"] else price + 0.5*atr
-        sup = levels["support"][0][0] if levels["support"] else price - 1.0*atr
-        entry = max(price, res + 0.1*atr); stop = sup - 0.5*atr
-        t1, t2 = entry + 1.0*atr, entry + 2.0*atr
-    elif price < e20.iloc[-1] < e50.iloc[-1]:
-        bias = "BEARISH"
-        res = levels["resistance"][0][0] if levels["resistance"] else price + 1.0*atr
-        sup = levels["support"][0][0] if levels["support"] else price - 0.5*atr
-        entry = min(price, sup - 0.1*atr); stop = res + 0.5*atr
-        t1, t2 = entry - 1.0*atr, entry - 2.0*atr
+    trend = classify_trend(df["close"], ema20, ema50)
+    strong = (adx.iloc[-1] if not pd.isna(adx.iloc[-1]) else 0) > 18
+
+    if trend == "up" and strong:
+        bias, strat = "BULLISH", "Put Credit Spread (PCS)"
+    elif trend == "down" and strong:
+        bias, strat = "BEARISH", "Call Credit Spread (CCS)"
     else:
-        bias = "NEUTRAL"
-        if levels["resistance"] and levels["support"]:
-            top = levels["resistance"][0][0]; bot = levels["support"][0][0]
-        else:
-            top, bot = price + 1.5*atr, price - 1.5*atr
-        entry=None; stop=None; t1=(top+bot)/2; t2=top if abs(top-price)<abs(price-bot) else bot
-    return {"bias":bias,"atr":atr,"levels":levels,"entry":entry,"stop":stop,"targets":[t1,t2]}
+        bias, strat = "NEUTRAL", "Iron Condor (IC)"
 
-# ───────────────────────────── App chrome ─────────────────────────────
-st.set_page_config(page_title="TradeIt Compact", page_icon="📈", layout="wide")
-st.markdown("""
-<style>
-:root{--ink:#e8eef6;--muted:#a7b0c3;--bg:#0f121a;--panel:#121726;--accent:#2ca4ea;--bull:#17c964;--bear:#f31260;--neu:#eeb100;}
-html,body,.stApp{background:var(--bg);color:var(--ink)}
-.block-container{padding-top:.5rem;padding-bottom:1rem;}
-header, .st-emotion-cache-18ni7ap{visibility:hidden;height:0;}
-h1,h2,h3{margin:0 0 .25rem 0}
-.toolbar{display:flex;gap:.75rem;flex-wrap:wrap;align-items:center;background:var(--panel);border:1px solid #252b3b;border-radius:14px;padding:.5rem .75rem;margin:.25rem 0 .5rem}
-.badge{padding:.15rem .5rem;border-radius:999px;font-weight:700;font-size:.78rem}
-.bull{background:var(--bull);color:#00250c}
-.bear{background:var(--bear);color:#fff1f4}
-.neu{background:var(--neu);color:#221b00}
-.kv{display:flex;gap:10px;flex-wrap:wrap;font-size:.9rem}
-.kv b{color:#fff}
-.small{color:var(--muted);font-size:.85rem}
-.legend {opacity:.85}
-.topbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:.25rem 0 .25rem}
-.topbar .label{font-size:.9rem;color:var(--muted)}
-.selectbox{min-width:160px}
-@media(max-width:880px){
-  .toolbar{gap:.5rem;padding:.45rem .6rem}
-}
-</style>
-""", unsafe_allow_html=True)
+    return {"bias": bias, "strategy": strat, "atr": _atr, "levels": levels,
+            "adx": float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else None}
 
-# Title row
-col_title, col_right = st.columns([0.8,0.2])
-with col_title:
-    st.markdown("<h2>TradeIt — 1H / 4H / 1D</h2>", unsafe_allow_html=True)
-with col_right:
-    st.markdown("<div class='small' style='text-align:right;'>compact mode</div>", unsafe_allow_html=True)
+def _round5(x: float) -> int:
+    try: return int(round(x / 5.0) * 5)
+    except Exception: return int(x)
 
-# ───────────────────────────── Sidebar ─────────────────────────────
-st.sidebar.markdown("### Data")
-data_folder = st.sidebar.text_input("Folder with CSVs", value=".", help="Select folder with *.csv (5‑min preferred).")
-show_bbands = st.sidebar.checkbox("Bollinger Bands", True)
-show_adx    = st.sidebar.checkbox("ADX", True)
-chart_h     = st.sidebar.slider("Chart height", 360, 620, 460, help="Lower for tighter one‑page layout.")
-days_1h     = st.sidebar.slider("Days (1H)", 5, 90, 30)
-days_4h     = st.sidebar.slider("Days (4H)", 5, 60, 15)
-days_1d     = st.sidebar.slider("Days (1D)", 15, 365, 60)
+def strike_suggestions(df: pd.DataFrame, plan: dict) -> dict:
+    price = float(df["close"].iloc[-1]); atr = float(plan["atr"])
+    levs = plan["levels"]
+    vwap_last = float(df["vwap"].iloc[-1]) if "vwap" in df.columns and not pd.isna(df["vwap"].iloc[-1]) else price
+    s1 = levs["support"][0][0] if levs["support"] else price - atr
+    r1 = levs["resistance"][0][0] if levs["resistance"] else price + atr
+    h5 = float(df["high"].tail(5).max()); l5 = float(df["low"].tail(5).min())
+    floor = min(vwap_last, s1, l5); ceiling = max(vwap_last, r1, h5)
+    pcs_short = _round5(floor - atr); pcs_long  = pcs_short - 5
+    ccs_short = _round5(ceiling + atr); ccs_long  = ccs_short + 5
+    put_ic  = _round5(min(pcs_short, price - atr)); call_ic = _round5(max(ccs_short, price + atr))
+    return {"PCS": (pcs_short, pcs_long), "CCS": (ccs_short, ccs_long), "IC":  (put_ic, put_ic-5, call_ic, call_ic+5)}
 
-# Discover CSVs
-csv_paths = sorted(glob.glob(os.path.join(data_folder, "*.csv")))
-if not csv_paths:
-    st.error("No CSVs found in folder."); st.stop()
+# =========================
+# Volume features & alerts
+# =========================
+def add_volume_features(d: pd.DataFrame, spike_z=2.0) -> pd.DataFrame:
+    d = d.copy()
+    if "volume" not in d.columns or d["volume"].isna().all():
+        d["vol_state"] = "NA"; d["unusual"] = None; d["vol_z"] = np.nan; d["vol_ema"] = np.nan
+        return d
+    vol = d["volume"]
+    vol_ema = vol.ewm(span=20, adjust=False).mean()
+    vol_mean = vol.rolling(50).mean(); vol_std  = vol.rolling(50).std(ddof=0)
+    vol_z = (vol - vol_mean) / vol_std
+    state = np.where((vol_z >= spike_z) | (vol > vol_ema * 1.8), "Spiked",
+             np.where((vol_z <= -1.0) | (vol < vol_ema * 0.6), "Low", "Normal"))
 
-def _sym(p): return os.path.splitext(os.path.basename(p))[0].upper()
-opts = [_sym(p) for p in csv_paths]
+    rng = (d["high"] - d["low"]).fillna(0.0)
+    atr_proxy = rng.rolling(14).mean()
+    up_candle = d["close"] > d["open"]; dn_candle = d["close"] < d["open"]
+    big_bar = rng > (0.6 * atr_proxy)
+    unusual = np.where((state=="Spiked") & up_candle & big_bar, "Unusual Buy",
+               np.where((state=="Spiked") & dn_candle & big_bar, "Unusual Sell", None))
+    d["vol_ema"], d["vol_z"], d["vol_state"], d["unusual"] = vol_ema, vol_z, state, unusual
+    return d
 
-# Choose SPX by default if present; store ONLY in session_state and do NOT pass index to widget
-def _default_option(options):
-    if "SPX" in options:
-        return "SPX"
-    for opt in options:
-        if "SPX" in opt:
-            return opt
-    return options[0]
+def tape_alert_text(d: pd.DataFrame, plan: dict) -> str | None:
+    last = d.iloc[-1]
+    if str(last.get("vol_state","")) == "Spiked" and last.get("unusual", None):
+        rng = (last["high"] - last["low"])
+        z = last["vol_z"] if not pd.isna(last["vol_z"]) else 0.0
+        return f"{last['unusual']} · Spike Z≈{z:.1f} · Range {rng:.1f} · Bias {plan['bias']}"
+    return None
 
-if "symbol" not in st.session_state or st.session_state.symbol not in opts:
-    st.session_state.symbol = _default_option(opts)
-
-# Top inline Symbol dropdown (no index passed -> avoids the warning)
-st.markdown("<div class='topbar'><span class='label'>Symbol</span></div>", unsafe_allow_html=True)
-st.selectbox("", opts, key="symbol", label_visibility="collapsed")
-selected = st.session_state.symbol
-path = csv_paths[opts.index(selected)]
-
-# ───────────────────────────── Load ─────────────────────────────
+# =========================
+# Loading & enrichment
+# =========================
 @st.cache_data(show_spinner=False)
 def load_csv(p: str) -> pd.DataFrame:
     df = pd.read_csv(p)
     df.columns = [c.strip().lower() for c in df.columns]
-    df["date"] = pd.to_datetime(df[df.columns[0]] if "date" not in df.columns else df["date"], utc=True, errors="coerce")
-    df["date"] = pd.DatetimeIndex(df["date"]).tz_convert(None)
+
+    # detect datetime column
+    date_col = None
+    for cand in ["date", "datetime", "time", "timestamp"]:
+        if cand in df.columns:
+            date_col = cand
+            break
+    if date_col is None:
+        date_col = df.columns[0]
+
+    df["date"] = pd.to_datetime(df[date_col], utc=True, errors="coerce").dt.tz_convert(None)
+
     for c in ["open","high","low","close","volume"]:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c].astype(str).str.replace(",","",regex=False).str.replace("$","",regex=False), errors="coerce")
-    df = df.dropna(subset=["date","open","high","low","close"]).sort_values("date").reset_index(drop=True)
-    return df
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-def enrich(df: pd.DataFrame) -> pd.DataFrame:
+    return df.dropna(subset=["date","open","high","low","close"]).reset_index(drop=True)
+
+def enrich(df: pd.DataFrame, spike_z=2.0) -> pd.DataFrame:
     d = df.copy()
     d["rsi"] = calculate_rsi(d["close"])
     d["ema20"] = calculate_ema(d["close"],20)
@@ -206,102 +268,178 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     bb_u, bb_m, bb_l = calculate_bbands(d["close"],20,2.0)
     d["bb_upper"], d["bb_mid"], d["bb_lower"] = bb_u, bb_m, bb_l
     d["adx"] = calculate_adx(d)
+    macd, macd_sig = calculate_macd(d["close"])
+    d["macd"], d["macd_sig"] = macd, macd_sig
+    d = add_volume_features(d, spike_z=spike_z)
     return d
 
-def subset_days(d: pd.DataFrame, n:int) -> pd.DataFrame:
+# =========================
+# Price Action vs opening 15m
+# =========================
+def opening_15_close(src_df: pd.DataFrame) -> float | None:
+    if len(src_df) == 0: return None
+    d15 = resample_ohlcv(src_df, "15T")
+    d15["day"] = pd.to_datetime(d15["date"]).dt.date
+    last_day = d15["day"].iloc[-1]
+    first_bar = d15[d15["day"]==last_day].iloc[0] if (d15["day"]==last_day).any() else None
+    return float(first_bar["close"]) if first_bar is not None else None
+
+def price_action_tag(last_close: float, open15: float | None) -> str:
+    if open15 is None or np.isnan(open15): return ""
+    if last_close > open15 * 1.0005: status = "Above"
+    elif last_close < open15 * 0.9995: status = "Below"
+    else: status = "At"
+    return f"Price Action: {status} (vs 15m open {open15:.2f})"
+
+# =========================
+# Plotting
+# =========================
+def make_chart(d: pd.DataFrame, title: str, height: int = 560,
+               show_bbands: bool = True, show_vol: bool = True):
     d = d.copy()
-    d["date"] = pd.to_datetime(d["date"])
-    cutoff = d["date"].max().normalize() - pd.Timedelta(days=n-1)
-    return d[d["date"]>=cutoff]
-
-src = load_csv(path)
-d1h = enrich(resample_ohlcv(src,"1H"))
-d4h = enrich(resample_ohlcv(src,"4H"))
-d1d = enrich(resample_ohlcv(src,"1D"))
-
-def sr_line(levels: dict) -> str:
-    def to2(v): 
-        try: return f"{float(v):.2f}"
-        except: return "—"
-    s = [to2(x[0]) for x in levels.get("support",[])[:2]]
-    r = [to2(x[0]) for x in levels.get("resistance",[])[:2]]
-    while len(s)<2: s.append("—")
-    while len(r)<2: r.append("—")
-    return f"S1 {s[0]} · S2 {s[1]} | R1 {r[0]} · R2 {r[1]}"
-
-def bias_badge(bias: str) -> str:
-    if bias=="BULLISH": return "<span class='badge bull'>PCS</span>"
-    if bias=="BEARISH": return "<span class='badge bear'>CCS</span>"
-    return "<span class='badge neu'>IC</span>"
-
-def build_trade_plan_local(df: pd.DataFrame):
-    return build_trade_plan(df)
-
-def top_toolbar(d: pd.DataFrame, tf_name: str):
-    plan = build_trade_plan_local(d)
-    last = d.iloc[-1]
-    levs = fused_levels(d)
-    entry_txt = "" if plan["entry"] is None else f"<b>Entry</b> {plan['entry']:.2f} · <b>Stop</b> {plan['stop']:.2f} · <b>Targets</b> {plan['targets'][0]:.2f}/{plan['targets'][1]:.2f}"
-    line = sr_line(levs)
-    st.markdown(
-        f"""<div class="toolbar">
-            <div><b>{selected}</b> — {tf_name}</div>
-            <div>{bias_badge(plan['bias'])}</div>
-            <div class="kv"><span class="small">Close <b>{last['close']:.2f}</b></span>
-                             <span class="small">RSI <b>{last['rsi']:.1f}</b></span>
-                             <span class="small">ATR <b>{last['atr']:.2f}</b></span></div>
-            <div class="small legend">{line}</div>
-            <div class="small">{entry_txt}</div>
-        </div>""", unsafe_allow_html=True
-    )
-
-def plot_panel(d: pd.DataFrame, tf_name: str):
-    top_toolbar(d, tf_name)
-    lev = fused_levels(d)
     fig = go.Figure()
+
+    # price
     fig.add_trace(go.Candlestick(
         x=d["date"], open=d["open"], high=d["high"], low=d["low"], close=d["close"],
-        name="Price", increasing_line_color="#17c964", decreasing_line_color="#f31260"
+        increasing_line_color="#17c964", decreasing_line_color="#f31260", name="Price",
+        yaxis="y1"
     ))
-    fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"], name="EMA20", line=dict(dash="dot")))
-    fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"], name="EMA50", line=dict(dash="dot")))
-    if not d["vwap"].isna().all():
-        fig.add_trace(go.Scatter(x=d["date"], y=d["vwap"], name="VWAP", line=dict(dash="dash")))
-    for lv,_ in lev.get("support",[])[:3]: fig.add_hline(y=float(lv), line_color="#17c964", opacity=0.6)
-    for lv,_ in lev.get("resistance",[])[:3]: fig.add_hline(y=float(lv), line_color="#f31260", opacity=0.6)
-    for i,(lv,_) in enumerate(lev.get("support",[])[:2],1):
-        fig.add_annotation(x=d["date"].iloc[0], y=float(lv), text=f"S{i}", showarrow=False,
-                           font=dict(color="#17c964",size=10), bgcolor="rgba(23,201,100,0.12)",
-                           bordercolor="#17c964", borderwidth=1, xanchor="left", yanchor="bottom")
-    for i,(lv,_) in enumerate(lev.get("resistance",[])[:2],1):
-        fig.add_annotation(x=d["date"].iloc[0], y=float(lv), text=f"R{i}", showarrow=False,
-                           font=dict(color="#f31260",size=10), bgcolor="rgba(243,18,96,0.10)",
-                           bordercolor="#f31260", borderwidth=1, xanchor="left", yanchor="top")
+    fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"], name="EMA20", line=dict(dash="dot"), yaxis="y1"))
+    fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"], name="EMA50", line=dict(dash="dot"), yaxis="y1"))
+    if "vwap" in d and not d["vwap"].isna().all():
+        fig.add_trace(go.Scatter(x=d["date"], y=d["vwap"], name="VWAP", line=dict(dash="dash"), yaxis="y1"))
+
     if show_bbands:
-        fig.add_trace(go.Scatter(x=d["date"], y=d["bb_upper"], name="BB Upper", line=dict(width=1), opacity=.7))
-        fig.add_trace(go.Scatter(x=d["date"], y=d["bb_mid"],   name="BB Mid",   line=dict(width=1, dash="dot"), opacity=.6))
-        fig.add_trace(go.Scatter(x=d["date"], y=d["bb_lower"], name="BB Lower", line=dict(width=1), opacity=.7))
-    if show_adx and "adx" in d:
-        adx_val = float(d["adx"].iloc[-1]) if not pd.isna(d["adx"].iloc[-1]) else None
-        if adx_val is not None:
-            fig.add_annotation(x=d["date"].iloc[-1], y=float(d["high"].tail(50).max()),
-                               text=f"ADX {adx_val:.1f}", showarrow=False,
-                               bgcolor="rgba(238,177,0,0.15)", bordercolor="#eeb100", font=dict(size=10),
-                               xanchor="right", yanchor="bottom")
+        fig.add_trace(go.Scatter(x=d["date"], y=d["bb_upper"], name="BB Upper", line=dict(width=1), opacity=.7, yaxis="y1"))
+        fig.add_trace(go.Scatter(x=d["date"], y=d["bb_mid"],   name="BB Mid",   line=dict(width=1, dash="dot"), opacity=.6, yaxis="y1"))
+        fig.add_trace(go.Scatter(x=d["date"], y=d["bb_lower"], name="BB Lower", line=dict(width=1), opacity=.7, yaxis="y1"))
+
+    # volume pane
+    if show_vol and "volume" in d.columns:
+        vol_colors = np.where(d["close"]>=d["open"], "#17c964", "#f31260")
+        fig.add_trace(go.Bar(x=d["date"], y=d["volume"], name="Volume", marker_color=vol_colors, opacity=0.7, yaxis="y2"))
+        if "vol_state" in d.columns:
+            mask = d["vol_state"]=="Spiked"
+            fig.add_trace(go.Scatter(x=d["date"][mask], y=d["volume"][mask]*1.02,
+                                     mode="markers", name="Vol Spike", yaxis="y2",
+                                     marker=dict(size=7, symbol="triangle-up")))
+
+    # layout
     ymin, ymax = float(d["low"].min()), float(d["high"].max())
     pad = (ymax-ymin)*0.03 if ymax>ymin else 1.0
-    fig.update_yaxes(range=[ymin-pad, ymax+pad])
-    fig.update_layout(height=chart_h, margin=dict(l=8,r=8,t=10,b=8),
-                      plot_bgcolor="#121620", paper_bgcolor="#121620",
-                      font=dict(color="#e8eef6"),
-                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(
+        title=title,
+        height=height,
+        margin=dict(l=8, r=8, t=40, b=8),
+        plot_bgcolor="#121620", paper_bgcolor="#121620",
+        font=dict(color="#e8eef6"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        barmode="overlay",
+        yaxis=dict(domain=[0.25,1.0], range=[ymin-pad, ymax+pad], title=None),
+        yaxis2=dict(domain=[0.0,0.22], title=None)
+    )
+    return fig
 
-# ───────────────────────────── Tabs ─────────────────────────────
-tab1, tab2, tab3 = st.tabs(["1H","4H","1D"])
+# =========================
+# Streamlit UI
+# =========================
+st.markdown("<h1>iTrader - Technical Analysis</h1>", unsafe_allow_html=True)
+
+# Sidebar controls (except symbol)
+data_folder = st.sidebar.text_input("Folder with CSVs", value=".", help="Folder with SPX.csv (+ ES1.csv optional)")
+show_bbands = st.sidebar.checkbox("Bollinger Bands", True)
+show_vol    = st.sidebar.checkbox("Volume panel", True)
+spike_z     = st.sidebar.slider("Spike Z-score", 1.5, 4.0, 2.0, 0.1)
+days_1h     = st.sidebar.slider("Days (1H)", 5, 90, 30)
+days_4h     = st.sidebar.slider("Days (4H)", 5, 60, 15)
+days_1d     = st.sidebar.slider("Days (1D)", 15, 365, 60)
+
+# Discover CSVs
+csv_paths = sorted(glob.glob(os.path.join(data_folder, "*.csv")))
+if not csv_paths:
+    st.error("No CSVs found in folder"); st.stop()
+
+def _sym(p): return os.path.splitext(os.path.basename(p))[0].upper()
+opts = [_sym(p) for p in csv_paths]
+default_sym = "SPX" if "SPX" in opts else opts[0]
+
+# Main-area symbol dropdown (no session_state overwrite)
+symbol = st.selectbox("Symbol", opts, index=opts.index(default_sym), key="symbol")
+
+# Load selected
+path = csv_paths[opts.index(symbol)]
+src = load_csv(path)
+
+# ES1 volume proxy for SPX
+es1_path = None
+for p in csv_paths:
+    if _sym(p) == "ES1":
+        es1_path = p; break
+src_es1 = load_csv(es1_path) if (symbol == "SPX" and es1_path) else None
+
+# Build resampled frames
+d1h = resample_ohlcv(src, "1H")
+d4h = resample_ohlcv(src, "4H")
+d1d = resample_ohlcv(src, "1D")
+
+def inject_proxy_vol(resampled: pd.DataFrame, proxy_src: pd.DataFrame, rule: str) -> pd.DataFrame:
+    if proxy_src is None or "volume" not in proxy_src.columns:
+        return resampled
+    p = resample_ohlcv(proxy_src, rule)[["date","volume"]]
+    out = resampled.merge(p, on="date", how="left", suffixes=("","_proxy"))
+    out["volume"] = np.where(out["volume_proxy"].notna(), out["volume_proxy"], out.get("volume"))
+    return out.drop(columns=[c for c in out.columns if c.endswith("_proxy")])
+
+if symbol == "SPX" and src_es1 is not None:
+    d1h = inject_proxy_vol(d1h, src_es1, "1H")
+    d4h = inject_proxy_vol(d4h, src_es1, "4H")
+    d1d = inject_proxy_vol(d1d, src_es1, "1D")
+
+# Enrich
+d1h = enrich(d1h, spike_z=spike_z)
+d4h = enrich(d4h, spike_z=spike_z)
+d1d = enrich(d1d, spike_z=spike_z)
+
+# Subset windows
+def _subset_days(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    d = df.copy()
+    d["date"] = pd.to_datetime(d["date"])
+    cutoff = d["date"].max().normalize() - pd.Timedelta(days=n-1)
+    return d[d["date"] >= cutoff]
+
+d1h_view = _subset_days(d1h, days_1h)
+d4h_view = _subset_days(d4h, days_4h)
+d1d_view = _subset_days(d1d, days_1d)
+
+# Opening 15m & tags
+open15 = opening_15_close(src)
+plan_1h = build_trade_plan(d1h_view)
+strikes_1h = strike_suggestions(d1h_view, plan_1h)
+alert_1h = tape_alert_text(d1h_view, plan_1h)
+last = d1h_view.iloc[-1]
+pa_text = price_action_tag(float(last["close"]), open15)
+
+# Header summary under the dropdown
+st.markdown(f"### {symbol} — 1H")
+st.write(f"Close {last['close']:.2f} · ATR {plan_1h['atr']:.2f} · ADX {plan_1h['adx']:.1f} · {pa_text}")
+st.write(f"Bias: **{plan_1h['bias']}** · Strategy: **{plan_1h['strategy']}**")
+st.write(f"Volume: **{last.get('vol_state','NA')}**{' · ' + last['unusual'] if last.get('unusual') else ''}")
+st.write(f"Strikes → PCS {strikes_1h['PCS'][0]}/{strikes_1h['PCS'][1]} · "
+         f"CCS {strikes_1h['CCS'][0]}/{strikes_1h['CCS'][1]} · "
+         f"IC {strikes_1h['IC'][0]}/{strikes_1h['IC'][1]} · {strikes_1h['IC'][2]}/{strikes_1h['IC'][3]}")
+
+if alert_1h:
+    st.info(f"⚡ Tape Alert: {alert_1h}")
+
+# Tabs with charts
+tab1, tab2, tab3 = st.tabs(["1H", "4H", "1D"])
 with tab1:
-    plot_panel(subset_days(d1h, days_1h), "1H")
+    st.plotly_chart(make_chart(d1h_view, f"{symbol} — 1H", height=560, show_bbands=show_bbands, show_vol=show_vol),
+                    use_container_width=True)
 with tab2:
-    plot_panel(subset_days(d4h, days_4h), "4H")
+    st.plotly_chart(make_chart(d4h_view, f"{symbol} — 4H", height=520, show_bbands=show_bbands, show_vol=show_vol),
+                    use_container_width=True)
 with tab3:
-    plot_panel(subset_days(d1d, days_1d), "1D")
+    st.plotly_chart(make_chart(d1d_view, f"{symbol} — 1D", height=520, show_bbands=show_bbands, show_vol=show_vol),
+                    use_container_width=True)
