@@ -10,7 +10,7 @@ import streamlit as st
 # ------------------------------------------------------------
 # Streamlit config MUST be first before any st.* calls
 # ------------------------------------------------------------
-st.set_page_config(page_title="iTrader (Merged)", page_icon="📈", layout="wide")
+st.set_page_config(page_title="iTrader", page_icon="📈", layout="wide")
 
 # =========================
 # Core helpers & indicators
@@ -344,7 +344,7 @@ def make_chart(d: pd.DataFrame, title: str, height: int = 560,
 # =========================
 # Streamlit UI
 # =========================
-st.markdown("<h1>iTrader - Technical Analysis</h1>", unsafe_allow_html=True)
+st.markdown("<h4>iTrader - Technical Analysis</h4>", unsafe_allow_html=True)
 
 # Sidebar controls (except symbol)
 data_folder = st.sidebar.text_input("Folder with CSVs", value=".", help="Folder with SPX.csv (+ ES1.csv optional)")
