@@ -1,16 +1,33 @@
-# iTrader_merged.py
-# Streamlit dashboard for SPX/ES/etc technical analysis with credit-spread helpers.
 
-import os, glob
+# TradeIt.py — iTrader with 1H / 4H / 1D / 1W
+# Adds projected ranges, range method toggle, IC width control,
+# delta proxy, colored headers, and consistent dark theme.
+
+import os, glob, math
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 # ------------------------------------------------------------
-# Streamlit config MUST be first before any st.* calls
+# Streamlit config MUST be first
 # ------------------------------------------------------------
 st.set_page_config(page_title="iTrader", page_icon="📈", layout="wide")
+
+# =========================
+# Theme / palette
+# =========================
+PALETTE = {
+    "bg": "#0f1420",
+    "fg": "#e6edf7",
+    "green": "#17c964",
+    "red": "#f31260",
+    "muted": "#9aa4b2",
+    "accent": "#50b4ff",
+    "bull": "#22c55e",
+    "bear": "#ef4444",
+    "neutral": "#9ca3af",
+}
 
 # =========================
 # Core helpers & indicators
@@ -28,7 +45,7 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
 
     for c in ["open","high","low","close"]:
         if c not in d.columns:
-            d[c] = d["close"]
+            d[c] = d.get("close", np.nan)
 
     o = d["open"].resample(rule).first()
     h = d["high"].resample(rule).max()
@@ -66,27 +83,41 @@ def calculate_vwap(df: pd.DataFrame) -> pd.Series:
     return pv.cumsum() / df["volume"].cumsum()
 
 def calculate_atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"]
+    h, l, c = df["high"].astype(float), df["low"].astype(float), df["close"].astype(float)
     prev_c = c.shift(1)
-    tr = np.maximum(h - l, np.maximum((h - prev_c).abs(), (l - prev_c).abs()))
-    return tr.rolling(window).mean()
+    tr = pd.concat([(h - l).abs(), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    return tr.rolling(window, min_periods=2).mean()
 
 def calculate_bbands(prices: pd.Series, window: int = 20, mult: float = 2.0):
-    ma = prices.rolling(window).mean()
-    sd = prices.rolling(window).std(ddof=0)
+    ma = prices.rolling(window, min_periods=2).mean()
+    sd = prices.rolling(window, min_periods=2).std(ddof=0)
     return ma + mult * sd, ma, ma - mult * sd
 
 def calculate_adx(df: pd.DataFrame, window: int = 14) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"]
-    up = h.diff(); down = -l.diff()
-    plus_dm  = ((up > down) & (up > 0)).astype(float) * up
-    minus_dm = ((down > up) & (down > 0)).astype(float) * down
-    tr = (h.combine(c.shift(), max) - l.combine(c.shift(), min)).abs()
-    tr = tr.rolling(window).sum()
-    plus_di  = 100 * (plus_dm.rolling(window).sum() / tr)
-    minus_di = 100 * (minus_dm.rolling(window).sum() / tr)
-    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)) * 100
-    return dx.rolling(window).mean()
+    # Wilder-smoothed, vectorized ADX
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+    c = df["close"].astype(float)
+
+    up_move = h.diff()
+    down_move = -l.diff()
+
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    tr = pd.concat([(h - l).abs(), (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+
+    alpha = 1.0 / float(window)
+    atr = tr.ewm(alpha=alpha, adjust=False).mean()
+    plus_sm = plus_dm.ewm(alpha=alpha, adjust=False).mean()
+    minus_sm = minus_dm.ewm(alpha=alpha, adjust=False).mean()
+
+    plus_di = 100.0 * (plus_sm / atr.replace(0, np.nan))
+    minus_di = 100.0 * (minus_sm / atr.replace(0, np.nan))
+
+    dx = (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) * 100.0
+    adx = dx.ewm(alpha=alpha, adjust=False).mean()
+    return adx
 
 # =========================
 # S/R + trade plan + strikes
@@ -99,8 +130,8 @@ def _pivot_points(df: pd.DataFrame):
     return P, R1, S1, R2, S2
 
 def _donchian(df: pd.DataFrame, n: int = 20):
-    upper = df["high"].rolling(n).max()
-    lower = df["low"].rolling(n).min()
+    upper = df["high"].rolling(n, min_periods=2).max()
+    lower = df["low"].rolling(n, min_periods=2).min()
     mid = (upper + lower) / 2.0
     return upper, lower, mid
 
@@ -185,7 +216,7 @@ def build_trade_plan(df: pd.DataFrame):
             "adx": float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else None}
 
 def _round5(x: float) -> int:
-    try: return int(round(x / 5.0) * 5)
+    try: return int(round(float(x) / 5.0) * 5)
     except Exception: return int(x)
 
 def strike_suggestions(df: pd.DataFrame, plan: dict) -> dict:
@@ -292,6 +323,42 @@ def price_action_tag(last_close: float, open15: float | None) -> str:
     return f"Price Action: {status} (vs 15m open {open15:.2f})"
 
 # =========================
+# Projected Range Helper
+# =========================
+def projected_range(df: pd.DataFrame, k_atr: float = 1.0, use_bbands: bool = True, use_sr: bool = True, min_periods: int = 5):
+    """
+    Projected range using ATR, optionally blended with BBands and nearest S/R.
+    Robust for small 1D/1W samples.
+    """
+    d = df.dropna(subset=["close","high","low"]).copy()
+    # ensure ATR exists
+    if "atr" not in d.columns:
+        d["atr"] = calculate_atr(d)
+    if d["atr"].isna().iloc[-1]:
+        tr = (d["high"] - d["low"]).abs()
+        win = min(14, max(min_periods, len(tr)))
+        d.loc[:, "atr"] = tr.rolling(win, min_periods=min_periods).mean()
+    d = d.dropna(subset=["atr"])
+    if d.empty:
+        return None, None
+
+    last = d.iloc[-1]
+    close = float(last["close"]); atr = float(last["atr"]) if not pd.isna(last["atr"]) else 0.0
+    core_hi = close + k_atr * atr; core_lo = close - k_atr * atr
+    hi_candidates = [core_hi]; lo_candidates = [core_lo]
+
+    if use_bbands and {"bb_upper","bb_lower"}.issubset(d.columns):
+        if not pd.isna(last["bb_upper"]): hi_candidates.append(float(last["bb_upper"]))
+        if not pd.isna(last["bb_lower"]): lo_candidates.append(float(last["bb_lower"]))
+
+    if use_sr:
+        levs = fused_levels(d)
+        if levs["resistance"]: hi_candidates.append(float(levs["resistance"][0][0]))
+        if levs["support"]: lo_candidates.append(float(levs["support"][0][0]))
+
+    return float(min(lo_candidates)), float(max(hi_candidates))
+
+# =========================
 # Plotting
 # =========================
 def make_chart(d: pd.DataFrame, title: str, height: int = 560,
@@ -302,7 +369,7 @@ def make_chart(d: pd.DataFrame, title: str, height: int = 560,
     # price
     fig.add_trace(go.Candlestick(
         x=d["date"], open=d["open"], high=d["high"], low=d["low"], close=d["close"],
-        increasing_line_color="#17c964", decreasing_line_color="#f31260", name="Price",
+        increasing_line_color=PALETTE["green"], decreasing_line_color=PALETTE["red"], name="Price",
         yaxis="y1"
     ))
     fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"], name="EMA20", line=dict(dash="dot"), yaxis="y1"))
@@ -317,13 +384,13 @@ def make_chart(d: pd.DataFrame, title: str, height: int = 560,
 
     # volume pane
     if show_vol and "volume" in d.columns:
-        vol_colors = np.where(d["close"]>=d["open"], "#17c964", "#f31260")
+        vol_colors = np.where(d["close"]>=d["open"], PALETTE["green"], PALETTE["red"])
         fig.add_trace(go.Bar(x=d["date"], y=d["volume"], name="Volume", marker_color=vol_colors, opacity=0.7, yaxis="y2"))
         if "vol_state" in d.columns:
             mask = d["vol_state"]=="Spiked"
             fig.add_trace(go.Scatter(x=d["date"][mask], y=d["volume"][mask]*1.02,
                                      mode="markers", name="Vol Spike", yaxis="y2",
-                                     marker=dict(size=7, symbol="triangle-up")))
+                                     marker=dict(size=7, symbol="triangle-up", color=PALETTE["accent"])))
 
     # layout
     ymin, ymax = float(d["low"].min()), float(d["high"].max())
@@ -332,12 +399,12 @@ def make_chart(d: pd.DataFrame, title: str, height: int = 560,
         title=title,
         height=height,
         margin=dict(l=8, r=8, t=40, b=8),
-        plot_bgcolor="#121620", paper_bgcolor="#121620",
-        font=dict(color="#e8eef6"),
+        plot_bgcolor=PALETTE["bg"], paper_bgcolor=PALETTE["bg"],
+        font=dict(color=PALETTE["fg"]),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         barmode="overlay",
-        yaxis=dict(domain=[0.25,1.0], range=[ymin-pad, ymax+pad], title=None),
-        yaxis2=dict(domain=[0.0,0.22], title=None)
+        yaxis=dict(domain=[0.25,1.0], range=[ymin-pad, ymax+pad], title=None, gridcolor="#1f2430"),
+        yaxis2=dict(domain=[0.0,0.22], title=None, gridcolor="#1f2430")
     )
     return fig
 
@@ -347,13 +414,6 @@ def make_chart(d: pd.DataFrame, title: str, height: int = 560,
 def compute_trade_levels(df: pd.DataFrame, plan: dict, rr: float = 1.5,
                          stop_mult: float = 0.8, t1_mult: float = 0.5,
                          t2_mult: float = 1.0, t3_mult: float = 1.5):
-    """
-    Computes simple ATR-based levels.
-    - Direction chooses long for BULLISH, short for BEARISH; for NEUTRAL returns both.
-    - Entry: last close
-    - Stop: ATR * stop_mult away in opposite direction
-    - Targets: ATR * [t1,t2,t3] in direction
-    """
     last = df.iloc[-1]
     entry = float(last['close'])
     atr = float(plan['atr'])
@@ -371,15 +431,10 @@ def compute_trade_levels(df: pd.DataFrame, plan: dict, rr: float = 1.5,
         return {'primary': _dir_levels('long')}
     if bias == 'BEARISH':
         return {'primary': _dir_levels('short')}
-    # Neutral → show both
     return {'long': _dir_levels('long'), 'short': _dir_levels('short')}
 
 def add_levels_to_figure(fig: go.Figure, levels: dict, yaxis='y1'):
-    """
-    Draws horizontal lines for Entry/Stop/T1/T2/T3. No text annotation; we'll show
-    levels inline above the chart for clarity.
-    """
-    def _draw_set(lv: dict, color='#31c48d'):
+    def _draw_set(lv: dict, color=PALETTE["bull"]):
         fig.add_hline(y=lv['stop'], line=dict(width=1, dash='dot', color=color))
         fig.add_hline(y=lv['t1'],   line=dict(width=1, dash='solid', color=color))
         fig.add_hline(y=lv['t2'],   line=dict(width=1, dash='dash', color=color))
@@ -388,58 +443,31 @@ def add_levels_to_figure(fig: go.Figure, levels: dict, yaxis='y1'):
     if not levels:
         return fig
     if 'primary' in levels:
-        _draw_set(levels['primary'], color='#36d399')
+        _draw_set(levels['primary'], color=PALETTE["bull"])
     else:
-        _draw_set(levels['long'], color='#36d399')
-        _draw_set(levels['short'], color='#f87272')
-    return fig
-    if 'primary' in levels:
-        _draw_set('Primary', levels['primary'], color='#36d399')
-    else:
-        _draw_set('Long', levels['long'], color='#36d399')
-        _draw_set('Short', levels['short'], color='#f87272')
+        _draw_set(levels['long'], color=PALETTE["bull"])
+        _draw_set(levels['short'], color=PALETTE["bear"])
     return fig
 
-
 # =========================
-# Header formatting helpers
+# Delta proxy helper
 # =========================
-
-def _fmt(v: float) -> str:
-    # compact number formatting
-    return f"{v:.1f}"
-
-def header_levels_md(symbol: str, tf_label: str, lv_dict: dict) -> str:
-    def block(label: str, lv: dict, cls: str) -> str:
-        return (f"<span class='pill {cls}'>{label}</span> "
-                f"E:{_fmt(lv['entry'])} · S:{_fmt(lv['stop'])} · "
-                f"T1:{_fmt(lv['t1'])} · T2:{_fmt(lv['t2'])} · T3:{_fmt(lv['t3'])}")
-    if not lv_dict: 
-        return f"<h3>{symbol} — {tf_label}</h3>"
-    if 'primary' in lv_dict:
-        lbl = 'LONG' if lv_dict['primary']['direction']=='long' else 'SHORT'
-        html = f"<h3>{symbol} — {tf_label} · " + block(lbl, lv_dict['primary'], 'ok') + "</h3>"
-    else:
-        html = (f"<h3>{symbol} — {tf_label} · " 
-                + block('LONG', lv_dict['long'], 'ok') + " · "
-                + block('SHORT', lv_dict['short'], 'warn') + "</h3>")
-    style = """
-    <style>
-    h3 { margin: 0.2rem 0 0.6rem; }
-    .pill { padding: 2px 8px; border-radius: 9999px; font-weight: 600; }
-    .ok { background: rgba(54,211,153,0.15); border:1px solid rgba(54,211,153,0.4); }
-    .warn { background: rgba(248,114,114,0.15); border:1px solid rgba(248,114,114,0.4); }
-    h3, .pill { font-size: 1.1rem; }
-    @media (max-width: 900px) { h3, .pill { font-size: 0.95rem; } }
-    </style>
+def delta_proxy_from_dist(dist_in_atr: float) -> float:
     """
-    return style + html
+    Heuristic 'delta-like' proxy from distance measured in ATRs.
+    Closer to 0.5 at-the-money, decays toward 0 as distance grows.
+    """
+    if dist_in_atr is None or not np.isfinite(dist_in_atr):
+        return np.nan
+    # logistic-ish decay; tunable factor 0.9
+    return float(max(0.01, min(0.5, 0.5 * math.exp(-0.9 * max(0.0, dist_in_atr)))))
+
 # =========================
-# Streamlit UI
+# UI
 # =========================
 st.markdown("<h4>iTrader - Technical Analysis</h4>", unsafe_allow_html=True)
 
-# Sidebar controls (except symbol)
+# Sidebar controls
 data_folder = st.sidebar.text_input("Folder with CSVs", value=".", help="Folder with SPX.csv (+ ES1.csv optional)")
 show_bbands = st.sidebar.checkbox("Bollinger Bands", True)
 show_vol    = st.sidebar.checkbox("Volume panel", True)
@@ -452,6 +480,9 @@ spike_z     = st.sidebar.slider("Spike Z-score", 1.5, 4.0, 2.0, 0.1)
 days_1h     = st.sidebar.slider("Days (1H)", 5, 90, 30)
 days_4h     = st.sidebar.slider("Days (4H)", 5, 60, 15)
 days_1d     = st.sidebar.slider("Days (1D)", 15, 365, 60)
+weeks_1w    = st.sidebar.slider("Weeks (1W)", 4, 156, 52)
+range_method = st.sidebar.selectbox("Range Method", ["ATR-only", "ATR + BB + S/R"], index=1)
+ic_width = st.sidebar.select_slider("IC Width (points)", options=[5,10,15,20,25,30], value=10)
 
 # Discover CSVs
 csv_paths = sorted(glob.glob(os.path.join(data_folder, "*.csv")))
@@ -462,7 +493,7 @@ def _sym(p): return os.path.splitext(os.path.basename(p))[0].upper()
 opts = [_sym(p) for p in csv_paths]
 default_sym = "SPX" if "SPX" in opts else opts[0]
 
-# Main-area symbol dropdown (no session_state overwrite)
+# Symbol dropdown
 symbol = st.selectbox("Symbol", opts, index=opts.index(default_sym), key="symbol")
 
 # Load selected
@@ -480,6 +511,7 @@ src_es1 = load_csv(es1_path) if (symbol == "SPX" and es1_path) else None
 d1h = resample_ohlcv(src, "1H")
 d4h = resample_ohlcv(src, "4H")
 d1d = resample_ohlcv(src, "1D")
+d1w = resample_ohlcv(src, "1W")
 
 def inject_proxy_vol(resampled: pd.DataFrame, proxy_src: pd.DataFrame, rule: str) -> pd.DataFrame:
     if proxy_src is None or "volume" not in proxy_src.columns:
@@ -493,11 +525,13 @@ if symbol == "SPX" and src_es1 is not None:
     d1h = inject_proxy_vol(d1h, src_es1, "1H")
     d4h = inject_proxy_vol(d4h, src_es1, "4H")
     d1d = inject_proxy_vol(d1d, src_es1, "1D")
+    d1w = inject_proxy_vol(d1w, src_es1, "1W")
 
 # Enrich
 d1h = enrich(d1h, spike_z=spike_z)
 d4h = enrich(d4h, spike_z=spike_z)
 d1d = enrich(d1d, spike_z=spike_z)
+d1w = enrich(d1w, spike_z=spike_z)
 
 # Subset windows
 def _subset_days(df: pd.DataFrame, n: int) -> pd.DataFrame:
@@ -506,11 +540,15 @@ def _subset_days(df: pd.DataFrame, n: int) -> pd.DataFrame:
     cutoff = d["date"].max().normalize() - pd.Timedelta(days=n-1)
     return d[d["date"] >= cutoff]
 
+def _subset_weeks(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    return _subset_days(df, n*7)
+
 d1h_view = _subset_days(d1h, days_1h)
 d4h_view = _subset_days(d4h, days_4h)
 d1d_view = _subset_days(d1d, days_1d)
+d1w_view = _subset_weeks(d1w, weeks_1w)
 
-# Opening 15m & tags
+# Opening 15m & header tags
 open15 = opening_15_close(src)
 plan_1h = build_trade_plan(d1h_view)
 strikes_1h = strike_suggestions(d1h_view, plan_1h)
@@ -518,85 +556,110 @@ alert_1h = tape_alert_text(d1h_view, plan_1h)
 last = d1h_view.iloc[-1]
 pa_text = price_action_tag(float(last["close"]), open15)
 
-# Header summary under the dropdown
+# ---- Projected ranges for header ----
+use_b = (range_method == "ATR + BB + S/R")
+use_s = (range_method == "ATR + BB + S/R")
+lo_1h, hi_1h = projected_range(d1h_view, k_atr=0.75, use_bbands=use_b, use_sr=use_s)
+lo_4h, hi_4h = projected_range(d4h_view, k_atr=1.00, use_bbands=use_b, use_sr=use_s)
+lo_1d, hi_1d = projected_range(d1d_view, k_atr=1.25, use_bbands=use_b, use_sr=use_s)
+lo_1w, hi_1w = projected_range(d1w_view, k_atr=1.50, use_bbands=use_b, use_sr=use_s)
+
+def _fmt(x):
+    return f"{x:.1f}" if x is not None else "—"
+
+header_ranges = (
+    f"Ranges → 1H {_fmt(lo_1h)}–{_fmt(hi_1h)} · "
+    f"4H {_fmt(lo_4h)}–{_fmt(hi_4h)} · "
+    f"1D {_fmt(lo_1d)}–{_fmt(hi_1d)} · "
+    f"1W {_fmt(lo_1w)}–{_fmt(hi_1w)} "
+    f"({range_method})"
+)
+
+# Header summary
 st.markdown(f"### {symbol} — 1H")
 st.write(f"Close {last['close']:.2f} · ATR {plan_1h['atr']:.2f} · ADX {plan_1h['adx']:.1f} · {pa_text}")
 st.write(f"Bias: **{plan_1h['bias']}** · Strategy: **{plan_1h['strategy']}**")
+bias = plan_1h["bias"] or "NEUTRAL"
+bias_color = {"BULLISH":PALETTE["bull"], "BEARISH":PALETTE["bear"], "NEUTRAL":PALETTE["neutral"]}.get(bias, PALETTE["neutral"])
+st.markdown(f'<div style="color:{bias_color};font-weight:600;">{header_ranges}</div>', unsafe_allow_html=True)
 st.write(f"Volume: **{last.get('vol_state','NA')}**{' · ' + last['unusual'] if last.get('unusual') else ''}")
 st.write(f"Strikes → PCS {strikes_1h['PCS'][0]}/{strikes_1h['PCS'][1]} · "
          f"CCS {strikes_1h['CCS'][0]}/{strikes_1h['CCS'][1]} · "
          f"IC {strikes_1h['IC'][0]}/{strikes_1h['IC'][1]} · {strikes_1h['IC'][2]}/{strikes_1h['IC'][3]}")
 
+# --- Quick IC rails from 1D/1W ranges ---
+def _ic_block(lo, hi, atr):
+    if lo is None or hi is None or atr is None or atr == 0:
+        return "—", np.nan, np.nan
+    put = _round5(lo); call = _round5(hi)
+    put_long, call_long = put - ic_width, call + ic_width
+    # delta proxies based on distance in ATR
+    mid = (lo + hi) / 2.0  # not used; use short vs spot distance
+    # We use last close from the corresponding timeframe (approx with 1H last close)
+    return f"{put}/{put_long} & {call}/{call_long}", put, call
+
+# Compute IC rails + delta proxies
+def _delta_for_frame(df_view, short_put, short_call):
+    if df_view is None or len(df_view)==0 or short_put is None or short_call is None:
+        return np.nan, np.nan
+    close = float(df_view["close"].iloc[-1])
+    atr = float(df_view["atr"].iloc[-1]) if "atr" in df_view.columns else float(calculate_atr(df_view).iloc[-1])
+    if not np.isfinite(atr) or atr <= 0: 
+        return np.nan, np.nan
+    dist_put = max(0.0, (close - short_put) / atr)
+    dist_call = max(0.0, (short_call - close) / atr)
+    return delta_proxy_from_dist(dist_put), delta_proxy_from_dist(dist_call)
+
+ic_1d_text, put_1d, call_1d = _ic_block(lo_1d, hi_1d, float(d1d_view["atr"].iloc[-1]) if "atr" in d1d_view.columns and not d1d_view["atr"].isna().all() else None)
+ic_1w_text, put_1w, call_1w = _ic_block(lo_1w, hi_1w, float(d1w_view["atr"].iloc[-1]) if "atr" in d1w_view.columns and not d1w_view["atr"].isna().all() else None)
+
+p_delta_1d, c_delta_1d = _delta_for_frame(d1d_view, put_1d, call_1d)
+p_delta_1w, c_delta_1w = _delta_for_frame(d1w_view, put_1w, call_1w)
+
+st.markdown(
+    f"<div style='opacity:0.9'>"
+    f"<b>IC 1D Rails:</b> {ic_1d_text} "
+    f"(Δ≈{p_delta_1d:.2f} / {c_delta_1d:.2f}) &nbsp; · &nbsp; "
+    f"<b>IC 1W Rails:</b> {ic_1w_text} "
+    f"(Δ≈{p_delta_1w:.2f} / {c_delta_1w:.2f})"
+    f"</div>", unsafe_allow_html=True
+)
+
 if alert_1h:
     st.info(f"⚡ Tape Alert: {alert_1h}")
 
-# Tabs with charts
-tab1, tab2, tab3 = st.tabs(["1H", "4H", "1D"])
+# Tabs with charts (1H/4H/1D/1W)
+tab1, tab2, tab3, tab4 = st.tabs(["1H", "4H", "1D", "1W"])
 
-with tab1:
-    lv1 = compute_trade_levels(d1h_view, plan_1h, stop_mult=stop_mult,
-                               t1_mult=t1_mult, t2_mult=t2_mult, t3_mult=t3_mult)
-  #  st.markdown(f"### {symbol} — 1H")
-    if lv1:
-        if 'primary' in lv1:
-            lv = lv1['primary']
-            st.caption(f"**{lv['direction'].upper()}** · E:{lv['entry']:.1f} · S:{lv['stop']:.1f} · "
-                       f"T1:{lv['t1']:.1f} · T2:{lv['t2']:.1f} · T3:{lv['t3']:.1f}")
+def _render_tab(df, lbl):
+    plan = build_trade_plan(df)
+    lv = compute_trade_levels(df, plan, stop_mult=stop_mult,
+                              t1_mult=t1_mult, t2_mult=t2_mult, t3_mult=t3_mult)
+    st.markdown(f"### {symbol} — {lbl}")
+    if lv:
+        if 'primary' in lv:
+            p = lv['primary']
+            st.caption(f"**{p['direction'].upper()}** · E:{p['entry']:.1f} · S:{p['stop']:.1f} · "
+                       f"T1:{p['t1']:.1f} · T2:{p['t2']:.1f} · T3:{p['t3']:.1f}")
         else:
-            st.caption(f"**LONG** · E:{lv1['long']['entry']:.1f} · S:{lv1['long']['stop']:.1f} · "
-                       f"T1:{lv1['long']['t1']:.1f} · T2:{lv1['long']['t2']:.1f} · T3:{lv1['long']['t3']:.1f}")
-            st.caption(f"**SHORT** · E:{lv1['short']['entry']:.1f} · S:{lv1['short']['stop']:.1f} · "
-                       f"T1:{lv1['short']['t1']:.1f} · T2:{lv1['short']['t2']:.1f} · T3:{lv1['short']['t3']:.1f}")
+            st.caption(f"**LONG** · E:{lv['long']['entry']:.1f} · S:{lv['long']['stop']:.1f} · "
+                       f"T1:{lv['long']['t1']:.1f} · T2:{lv['long']['t2']:.1f} · T3:{lv['long']['t3']:.1f}")
+            st.caption(f"**SHORT** · E:{lv['short']['entry']:.1f} · S:{lv['short']['stop']:.1f} · "
+                       f"T1:{lv['short']['t1']:.1f} · T2:{lv['short']['t2']:.1f} · T3:{lv['short']['t3']:.1f}")
+    # range band for tab
+    k_map = {"1H":0.75,"4H":1.00,"1D":1.25,"1W":1.50}
+    use_b = (range_method == "ATR + BB + S/R")
+    use_s = (range_method == "ATR + BB + S/R")
+    lo, hi = projected_range(df, k_atr=k_map[lbl], use_bbands=use_b, use_sr=use_s)
+    if lo is not None and hi is not None:
+        st.caption(f"Projected Range: {lo:.1f} — {hi:.1f}")
+    fig = make_chart(df, f"{symbol} — {lbl}", height=520, show_bbands=show_bbands, show_vol=show_vol)
+    if show_levels: fig = add_levels_to_figure(fig, lv)
+    if lo is not None and hi is not None:
+        fig.add_hrect(y0=lo, y1=hi, fillcolor="rgba(80,180,255,0.08)", line_width=0)
+    st.plotly_chart(fig, use_container_width=True)
 
-    fig1 = make_chart(d1h_view, f"{symbol} — 1H", height=560,
-                      show_bbands=show_bbands, show_vol=show_vol)
-    if show_levels:
-        fig1 = add_levels_to_figure(fig1, lv1)
-    st.plotly_chart(fig1, use_container_width=True)
-
-
-with tab2:
-    plan_4h = build_trade_plan(d4h_view)
-    lv2 = compute_trade_levels(d4h_view, plan_4h, stop_mult=stop_mult,
-                               t1_mult=t1_mult, t2_mult=t2_mult, t3_mult=t3_mult)
-    #st.markdown(f"### {symbol} — 4H")
-    if lv2:
-        if 'primary' in lv2:
-            lv = lv2['primary']
-            st.caption(f"**{lv['direction'].upper()}** · E:{lv['entry']:.1f} · S:{lv['stop']:.1f} · "
-                       f"T1:{lv['t1']:.1f} · T2:{lv['t2']:.1f} · T3:{lv['t3']:.1f}")
-        else:
-            st.caption(f"**LONG** · E:{lv2['long']['entry']:.1f} · S:{lv2['long']['stop']:.1f} · "
-                       f"T1:{lv2['long']['t1']:.1f} · T2:{lv2['long']['t2']:.1f} · T3:{lv2['long']['t3']:.1f}")
-            st.caption(f"**SHORT** · E:{lv2['short']['entry']:.1f} · S:{lv2['short']['stop']:.1f} · "
-                       f"T1:{lv2['short']['t1']:.1f} · T2:{lv2['short']['t2']:.1f} · T3:{lv2['short']['t3']:.1f}")
-
-    fig2 = make_chart(d4h_view, f"{symbol} — 4H", height=520,
-                      show_bbands=show_bbands, show_vol=show_vol)
-    if show_levels:
-        fig2 = add_levels_to_figure(fig2, lv2)
-    st.plotly_chart(fig2, use_container_width=True)
-
-
-with tab3:
-    plan_1d = build_trade_plan(d1d_view)
-    lv3 = compute_trade_levels(d1d_view, plan_1d, stop_mult=stop_mult,
-                               t1_mult=t1_mult, t2_mult=t2_mult, t3_mult=t3_mult)
-   # st.markdown(f"### {symbol} — 1D")
-    if lv3:
-        if 'primary' in lv3:
-            lv = lv3['primary']
-            st.caption(f"**{lv['direction'].upper()}** · E:{lv['entry']:.1f} · S:{lv['stop']:.1f} · "
-                       f"T1:{lv['t1']:.1f} · T2:{lv['t2']:.1f} · T3:{lv['t3']:.1f}")
-        else:
-            st.caption(f"**LONG** · E:{lv3['long']['entry']:.1f} · S:{lv3['long']['stop']:.1f} · "
-                       f"T1:{lv3['long']['t1']:.1f} · T2:{lv3['long']['t2']:.1f} · T3:{lv3['long']['t3']:.1f}")
-            st.caption(f"**SHORT** · E:{lv3['short']['entry']:.1f} · S:{lv3['short']['stop']:.1f} · "
-                       f"T1:{lv3['short']['t1']:.1f} · T2:{lv3['short']['t2']:.1f} · T3:{lv3['short']['t3']:.1f}")
-
-    fig3 = make_chart(d1d_view, f"{symbol} — 1D", height=520,
-                      show_bbands=show_bbands, show_vol=show_vol)
-    if show_levels:
-        fig3 = add_levels_to_figure(fig3, lv3)
-    st.plotly_chart(fig3, use_container_width=True)
-
+with tab1: _render_tab(d1h_view, "1H")
+with tab2: _render_tab(d4h_view, "4H")
+with tab3: _render_tab(d1d_view, "1D")
+with tab4: _render_tab(d1w_view, "1W")
