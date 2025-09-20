@@ -1,7 +1,8 @@
 
 # TradeIt.py — iTrader with 1H / 4H / 1D / 1W
-# Adds projected ranges, range method toggle, IC width control,
-# delta proxy, colored headers, and consistent dark theme.
+# Presets (AM Scalp, Lunch Chop, PM Fade), projected ranges, rail badges,
+# IC/PCS/CCS rails, delta proxy, volume features, and adaptive X-axis.
+# Streamlit >=1.26 (uses st.rerun).
 
 import os, glob, math
 import numpy as np
@@ -9,14 +10,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# ------------------------------------------------------------
-# Streamlit config MUST be first
-# ------------------------------------------------------------
 st.set_page_config(page_title="iTrader", page_icon="📈", layout="wide")
 
-# =========================
-# Theme / palette
-# =========================
 PALETTE = {
     "bg": "#0f1420",
     "fg": "#e6edf7",
@@ -29,9 +24,7 @@ PALETTE = {
     "neutral": "#9ca3af",
 }
 
-# =========================
-# Core helpers & indicators
-# =========================
+# ---------------- Core helpers / indicators ----------------
 def _to_naive_utc_index(series: pd.Series) -> pd.DatetimeIndex:
     s = pd.to_datetime(series, utc=True, errors="coerce")
     return pd.DatetimeIndex(s).tz_convert(None)
@@ -60,8 +53,8 @@ def calculate_rsi(prices: pd.Series, window: int = 14) -> pd.Series:
     delta = prices.diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
-    roll_up = up.rolling(window).mean()
-    roll_down = down.rolling(window).mean()
+    roll_up = up.rolling(window, min_periods=2).mean()
+    roll_down = down.rolling(window, min_periods=2).mean()
     rs = roll_up / roll_down
     return 100 - (100 / (1 + rs))
 
@@ -119,9 +112,7 @@ def calculate_adx(df: pd.DataFrame, window: int = 14) -> pd.Series:
     adx = dx.ewm(alpha=alpha, adjust=False).mean()
     return adx
 
-# =========================
-# S/R + trade plan + strikes
-# =========================
+# ---------------- S/R + plan + strikes ----------------
 def _pivot_points(df: pd.DataFrame):
     prev = df.shift(1)
     P = (prev["high"] + prev["low"] + prev["close"]) / 3.0
@@ -140,6 +131,10 @@ def _fractals(df: pd.DataFrame, left: int = 2, right: int = 2):
     sh = h[(h.shift(1).rolling(left).max() < h) & (h.shift(-1).rolling(right).max() < h)]
     sl = l[(l.shift(1).rolling(left).min() > l) & (l.shift(-1).rolling(right).min() > l)]
     return sh.dropna(), sl.dropna()
+
+def _round5(x: float) -> int:
+    try: return int(round(float(x) / 5.0) * 5)
+    except Exception: return int(x)
 
 def _round_levels(price: float, steps=(5, 10, 25, 50, 100)):
     s = set()
@@ -215,10 +210,6 @@ def build_trade_plan(df: pd.DataFrame):
     return {"bias": bias, "strategy": strat, "atr": _atr, "levels": levels,
             "adx": float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else None}
 
-def _round5(x: float) -> int:
-    try: return int(round(float(x) / 5.0) * 5)
-    except Exception: return int(x)
-
 def strike_suggestions(df: pd.DataFrame, plan: dict) -> dict:
     price = float(df["close"].iloc[-1]); atr = float(plan["atr"])
     levs = plan["levels"]
@@ -232,9 +223,7 @@ def strike_suggestions(df: pd.DataFrame, plan: dict) -> dict:
     put_ic  = _round5(min(pcs_short, price - atr)); call_ic = _round5(max(ccs_short, price + atr))
     return {"PCS": (pcs_short, pcs_long), "CCS": (ccs_short, ccs_long), "IC":  (put_ic, put_ic-5, call_ic, call_ic+5)}
 
-# =========================
-# Volume features & alerts
-# =========================
+# ---------------- Volume features & alerts ----------------
 def add_volume_features(d: pd.DataFrame, spike_z=2.0) -> pd.DataFrame:
     d = d.copy()
     if "volume" not in d.columns or d["volume"].isna().all():
@@ -264,74 +253,15 @@ def tape_alert_text(d: pd.DataFrame, plan: dict) -> str | None:
         return f"{last['unusual']} · Spike Z≈{z:.1f} · Range {rng:.1f} · Bias {plan['bias']}"
     return None
 
-# =========================
-# Loading & enrichment
-# =========================
-@st.cache_data(show_spinner=False)
-def load_csv(p: str) -> pd.DataFrame:
-    df = pd.read_csv(p)
-    df.columns = [c.strip().lower() for c in df.columns]
+# ---------------- Delta proxy ----------------
+def delta_proxy_from_dist(dist_in_atr: float, decay: float = 0.9) -> float:
+    if dist_in_atr is None or not np.isfinite(dist_in_atr):
+        return np.nan
+    return float(max(0.01, min(0.5, 0.5 * math.exp(-decay * max(0.0, dist_in_atr)))))
 
-    # detect datetime column
-    date_col = None
-    for cand in ["date", "datetime", "time", "timestamp"]:
-        if cand in df.columns:
-            date_col = cand
-            break
-    if date_col is None:
-        date_col = df.columns[0]
-
-    df["date"] = pd.to_datetime(df[date_col], utc=True, errors="coerce").dt.tz_convert(None)
-
-    for c in ["open","high","low","close","volume"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    return df.dropna(subset=["date","open","high","low","close"]).reset_index(drop=True)
-
-def enrich(df: pd.DataFrame, spike_z=2.0) -> pd.DataFrame:
-    d = df.copy()
-    d["rsi"] = calculate_rsi(d["close"])
-    d["ema20"] = calculate_ema(d["close"],20)
-    d["ema50"] = calculate_ema(d["close"],50)
-    d["vwap"]  = calculate_vwap(d)
-    d["atr"]   = calculate_atr(d)
-    bb_u, bb_m, bb_l = calculate_bbands(d["close"],20,2.0)
-    d["bb_upper"], d["bb_mid"], d["bb_lower"] = bb_u, bb_m, bb_l
-    d["adx"] = calculate_adx(d)
-    macd, macd_sig = calculate_macd(d["close"])
-    d["macd"], d["macd_sig"] = macd, macd_sig
-    d = add_volume_features(d, spike_z=spike_z)
-    return d
-
-# =========================
-# Price Action vs opening 15m
-# =========================
-def opening_15_close(src_df: pd.DataFrame) -> float | None:
-    if len(src_df) == 0: return None
-    d15 = resample_ohlcv(src_df, "15T")
-    d15["day"] = pd.to_datetime(d15["date"]).dt.date
-    last_day = d15["day"].iloc[-1]
-    first_bar = d15[d15["day"]==last_day].iloc[0] if (d15["day"]==last_day).any() else None
-    return float(first_bar["close"]) if first_bar is not None else None
-
-def price_action_tag(last_close: float, open15: float | None) -> str:
-    if open15 is None or np.isnan(open15): return ""
-    if last_close > open15 * 1.0005: status = "Above"
-    elif last_close < open15 * 0.9995: status = "Below"
-    else: status = "At"
-    return f"Price Action: {status} (vs 15m open {open15:.2f})"
-
-# =========================
-# Projected Range Helper
-# =========================
+# ---------------- Projected Range ----------------
 def projected_range(df: pd.DataFrame, k_atr: float = 1.0, use_bbands: bool = True, use_sr: bool = True, min_periods: int = 5):
-    """
-    Projected range using ATR, optionally blended with BBands and nearest S/R.
-    Robust for small 1D/1W samples.
-    """
     d = df.dropna(subset=["close","high","low"]).copy()
-    # ensure ATR exists
     if "atr" not in d.columns:
         d["atr"] = calculate_atr(d)
     if d["atr"].isna().iloc[-1]:
@@ -339,8 +269,7 @@ def projected_range(df: pd.DataFrame, k_atr: float = 1.0, use_bbands: bool = Tru
         win = min(14, max(min_periods, len(tr)))
         d.loc[:, "atr"] = tr.rolling(win, min_periods=min_periods).mean()
     d = d.dropna(subset=["atr"])
-    if d.empty:
-        return None, None
+    if d.empty: return None, None
 
     last = d.iloc[-1]
     close = float(last["close"]); atr = float(last["atr"]) if not pd.isna(last["atr"]) else 0.0
@@ -358,19 +287,15 @@ def projected_range(df: pd.DataFrame, k_atr: float = 1.0, use_bbands: bool = Tru
 
     return float(min(lo_candidates)), float(max(hi_candidates))
 
-# =========================
-# Plotting
-# =========================
+# ---------------- Plotting ----------------
 def make_chart(d: pd.DataFrame, title: str, height: int = 560,
-               show_bbands: bool = True, show_vol: bool = True):
+               show_bbands: bool = True, show_vol: bool = True, clamp_x: bool = True):
     d = d.copy()
     fig = go.Figure()
 
-    # price
     fig.add_trace(go.Candlestick(
         x=d["date"], open=d["open"], high=d["high"], low=d["low"], close=d["close"],
-        increasing_line_color=PALETTE["green"], decreasing_line_color=PALETTE["red"], name="Price",
-        yaxis="y1"
+        increasing_line_color=PALETTE["green"], decreasing_line_color=PALETTE["red"], name="Price", yaxis="y1"
     ))
     fig.add_trace(go.Scatter(x=d["date"], y=d["ema20"], name="EMA20", line=dict(dash="dot"), yaxis="y1"))
     fig.add_trace(go.Scatter(x=d["date"], y=d["ema50"], name="EMA50", line=dict(dash="dot"), yaxis="y1"))
@@ -382,7 +307,6 @@ def make_chart(d: pd.DataFrame, title: str, height: int = 560,
         fig.add_trace(go.Scatter(x=d["date"], y=d["bb_mid"],   name="BB Mid",   line=dict(width=1, dash="dot"), opacity=.6, yaxis="y1"))
         fig.add_trace(go.Scatter(x=d["date"], y=d["bb_lower"], name="BB Lower", line=dict(width=1), opacity=.7, yaxis="y1"))
 
-    # volume pane
     if show_vol and "volume" in d.columns:
         vol_colors = np.where(d["close"]>=d["open"], PALETTE["green"], PALETTE["red"])
         fig.add_trace(go.Bar(x=d["date"], y=d["volume"], name="Volume", marker_color=vol_colors, opacity=0.7, yaxis="y2"))
@@ -392,7 +316,6 @@ def make_chart(d: pd.DataFrame, title: str, height: int = 560,
                                      mode="markers", name="Vol Spike", yaxis="y2",
                                      marker=dict(size=7, symbol="triangle-up", color=PALETTE["accent"])))
 
-    # layout
     ymin, ymax = float(d["low"].min()), float(d["high"].max())
     pad = (ymax-ymin)*0.03 if ymax>ymin else 1.0
     fig.update_layout(
@@ -404,13 +327,22 @@ def make_chart(d: pd.DataFrame, title: str, height: int = 560,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         barmode="overlay",
         yaxis=dict(domain=[0.25,1.0], range=[ymin-pad, ymax+pad], title=None, gridcolor="#1f2430"),
-        yaxis2=dict(domain=[0.0,0.22], title=None, gridcolor="#1f2430")
+        yaxis2=dict(domain=[0.0,0.22], title=None, gridcolor="#1f2430"),
+        xaxis=dict(rangebreaks=[dict(bounds=['sat', 'mon'])])
     )
+
+    fig.update_xaxes(
+        tickformatstops=[
+            dict(dtickrange=[None, 1000*60*60*24], value="%b %d\n%H:%M"),
+            dict(dtickrange=[1000*60*60*24, 1000*60*60*24*31], value="%b %d"),
+            dict(dtickrange=[1000*60*60*24*31, None], value="%b %Y"),
+        ]
+    )
+    if clamp_x and len(d) >= 2:
+        fig.update_xaxes(range=[d["date"].iloc[0], d["date"].iloc[-1]])
     return fig
 
-# =========================
-# Trade Levels (Entry/Stop/Targets)
-# =========================
+# ---------------- Trade level visuals ----------------
 def compute_trade_levels(df: pd.DataFrame, plan: dict, rr: float = 1.5,
                          stop_mult: float = 0.8, t1_mult: float = 0.5,
                          t2_mult: float = 1.0, t3_mult: float = 1.5):
@@ -449,40 +381,170 @@ def add_levels_to_figure(fig: go.Figure, levels: dict, yaxis='y1'):
         _draw_set(levels['short'], color=PALETTE["bear"])
     return fig
 
-# =========================
-# Delta proxy helper
-# =========================
-def delta_proxy_from_dist(dist_in_atr: float) -> float:
-    """
-    Heuristic 'delta-like' proxy from distance measured in ATRs.
-    Closer to 0.5 at-the-money, decays toward 0 as distance grows.
-    """
-    if dist_in_atr is None or not np.isfinite(dist_in_atr):
-        return np.nan
-    # logistic-ish decay; tunable factor 0.9
-    return float(max(0.01, min(0.5, 0.5 * math.exp(-0.9 * max(0.0, dist_in_atr)))))
+# ---------------- Loading & enrichment ----------------
+@st.cache_data(show_spinner=False)
+def load_csv(p: str) -> pd.DataFrame:
+    df = pd.read_csv(p)
+    df.columns = [c.strip().lower() for c in df.columns]
+    date_col = None
+    for cand in ["date", "datetime", "time", "timestamp"]:
+        if cand in df.columns:
+            date_col = cand; break
+    if date_col is None:
+        date_col = df.columns[0]
 
-# =========================
-# UI
-# =========================
+    df["date"] = pd.to_datetime(df[date_col], utc=True, errors="coerce").dt.tz_convert(None)
+
+    for c in ["open","high","low","close","volume"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    return df.dropna(subset=["date","open","high","low","close"]).reset_index(drop=True)
+
+def enrich(df: pd.DataFrame, spike_z=2.0) -> pd.DataFrame:
+    d = df.copy()
+    d["rsi"] = calculate_rsi(d["close"])
+    d["ema20"] = calculate_ema(d["close"],20)
+    d["ema50"] = calculate_ema(d["close"],50)
+    d["vwap"]  = calculate_vwap(d)
+    d["atr"]   = calculate_atr(d)
+    bb_u, bb_m, bb_l = calculate_bbands(d["close"],20,2.0)
+    d["bb_upper"], d["bb_mid"], d["bb_lower"] = bb_u, bb_m, bb_l
+    d["adx"] = calculate_adx(d)
+    macd, macd_sig = calculate_macd(d["close"])
+    d["macd"], d["macd_sig"] = macd, macd_sig
+    d = add_volume_features(d, spike_z=spike_z)
+    return d
+
+# ---------------- Price action tags ----------------
+def opening_15_close(src_df: pd.DataFrame) -> float | None:
+    if len(src_df) == 0: return None
+    d15 = resample_ohlcv(src_df, "15T")
+    d15["day"] = pd.to_datetime(d15["date"]).dt.date
+    last_day = d15["day"].iloc[-1]
+    first_bar = d15[d15["day"]==last_day].iloc[0] if (d15["day"]==last_day).any() else None
+    return float(first_bar["close"]) if first_bar is not None else None
+
+def price_action_tag(last_close: float, open15: float | None) -> str:
+    if open15 is None or np.isnan(open15): return ""
+    if last_close > open15 * 1.0005: status = "Above"
+    elif last_close < open15 * 0.9995: status = "Below"
+    else: status = "At"
+    return f"Price Action: {status} (vs 15m open {open15:.2f})"
+
+# ---------------- Rail helpers ----------------
+def make_rail_texts(df, lo, hi, bias, ic_width, dir_width, decay):
+    close = float(df["close"].iloc[-1])
+    atr   = float(df["atr"].iloc[-1]) if "atr" in df.columns and not df["atr"].isna().all() else float(calculate_atr(df).iloc[-1])
+    short_put  = _round5(lo if lo is not None else close - atr)
+    short_call = _round5(hi if hi is not None else close + atr)
+
+    ic_text = f"IC {short_put}/{short_put-ic_width} & {short_call}/{short_call+ic_width}"
+    pcs_text = f"PCS {short_put}/{short_put-dir_width}"
+    ccs_text = f"CCS {short_call}/{short_call+dir_width}"
+
+    def _dp(sp, sc):
+        dist_p = max(0.0, (close - sp)/atr)
+        dist_c = max(0.0, (sc - close)/atr)
+        dp = delta_proxy_from_dist(dist_p, decay)
+        dc = delta_proxy_from_dist(dist_c, decay)
+        return dp, dc
+
+    dp_ic, dc_ic = _dp(short_put, short_call)
+    dp_dir, dc_dir = _dp(short_put, short_call)
+
+    if bias == "NEUTRAL":
+        main = f"{ic_text} (Δ≈{dp_ic:.2f}/{dc_ic:.2f})"
+    elif bias == "BULLISH":
+        main = f"{pcs_text} (Δ≈{dp_dir:.2f})"
+    else:
+        main = f"{ccs_text} (Δ≈{dc_dir:.2f})"
+
+    aux  = f"{pcs_text} · {ccs_text}"
+    return main, aux
+
+def add_rail_badge(fig, main_text, aux_text, bias_color="#50b4ff"):
+    fig.add_annotation(
+        xref="paper", yref="paper", x=0.01, y=0.98,
+        text=f"<b>{main_text}</b><br><span style='opacity:.8'>{aux_text}</span>",
+        showarrow=False, align="left",
+        bgcolor="rgba(20,28,40,0.80)", bordercolor=bias_color, borderwidth=1,
+        font=dict(size=12)
+    )
+    return fig
+
+# ---------------- UI ----------------
 st.markdown("<h4>iTrader - Technical Analysis</h4>", unsafe_allow_html=True)
+
+# Presets
+DEFAULTS = {
+    "range_method": "ATR + BB + S/R",
+    "days_1h": 30, "days_4h": 15, "days_1d": 60, "weeks_1w": 52,
+    "dir_width": 10, "ic_width_1d": 10, "ic_width_1w": 15,
+    "delta_decay": 0.9, "clamp_x": True,
+}
+PRESETS = {
+    "AM Scalp": {
+        "range_method": "ATR-only",
+        "days_1h": 7, "days_4h": 10, "days_1d": 60, "weeks_1w": 52,
+        "dir_width": 10, "ic_width_1d": 10, "ic_width_1w": 15,
+        "delta_decay": 1.10, "clamp_x": True
+    },
+    "Lunch Chop": {
+        "range_method": "ATR + BB + S/R",
+        "days_1h": 12, "days_4h": 18, "days_1d": 60, "weeks_1w": 52,
+        "dir_width": 12, "ic_width_1d": 15, "ic_width_1w": 20,
+        "delta_decay": 0.85, "clamp_x": True
+    },
+    "PM Fade": {
+        "range_method": "ATR-only",
+        "days_1h": 6, "days_4h": 12, "days_1d": 45, "weeks_1w": 52,
+        "dir_width": 18, "ic_width_1d": 20, "ic_width_1w": 25,
+        "delta_decay": 1.25, "clamp_x": True
+    },
+}
+def _init_state():
+    for k, v in DEFAULTS.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+_init_state()
+
+# Sidebar: presets first
+preset_name = st.sidebar.selectbox("Preset", ["Custom"] + list(PRESETS.keys()))
+if preset_name != "Custom" and st.sidebar.button("Apply Preset"):
+    st.session_state.update(PRESETS[preset_name])
+    st.rerun()
 
 # Sidebar controls
 data_folder = st.sidebar.text_input("Folder with CSVs", value=".", help="Folder with SPX.csv (+ ES1.csv optional)")
 show_bbands = st.sidebar.checkbox("Bollinger Bands", True)
 show_vol    = st.sidebar.checkbox("Volume panel", True)
 show_levels = st.sidebar.checkbox("Show Entry/Stop/Targets", True)
+
+days_1h  = st.sidebar.slider("Days (1H)", 3, 90, st.session_state["days_1h"], key="days_1h")
+days_4h  = st.sidebar.slider("Days (4H)", 3, 60, st.session_state["days_4h"], key="days_4h")
+days_1d  = st.sidebar.slider("Days (1D)", 5, 365, st.session_state["days_1d"], key="days_1d")
+weeks_1w = st.sidebar.slider("Weeks (1W)", 4, 156, st.session_state["weeks_1w"], key="weeks_1w")
+range_method = st.sidebar.selectbox("Range Method", ["ATR-only", "ATR + BB + S/R"], index=0 if st.session_state["range_method"]=="ATR-only" else 1, key="range_method")
+
 stop_mult = st.sidebar.slider("Stop (×ATR)", 0.3, 2.0, 0.8, 0.05)
-t1_mult = st.sidebar.slider("T1 (×ATR)", 0.3, 2.5, 0.5, 0.05)
-t2_mult = st.sidebar.slider("T2 (×ATR)", 0.5, 3.0, 1.0, 0.05)
-t3_mult = st.sidebar.slider("T3 (×ATR)", 0.5, 4.0, 1.5, 0.05)
-spike_z     = st.sidebar.slider("Spike Z-score", 1.5, 4.0, 2.0, 0.1)
-days_1h     = st.sidebar.slider("Days (1H)", 5, 90, 30)
-days_4h     = st.sidebar.slider("Days (4H)", 5, 60, 15)
-days_1d     = st.sidebar.slider("Days (1D)", 15, 365, 60)
-weeks_1w    = st.sidebar.slider("Weeks (1W)", 4, 156, 52)
-range_method = st.sidebar.selectbox("Range Method", ["ATR-only", "ATR + BB + S/R"], index=1)
-ic_width = st.sidebar.select_slider("IC Width (points)", options=[5,10,15,20,25,30], value=10)
+t1_mult   = st.sidebar.slider("T1 (×ATR)", 0.3, 2.5, 0.5, 0.05)
+t2_mult   = st.sidebar.slider("T2 (×ATR)", 0.5, 3.0, 1.0, 0.05)
+t3_mult   = st.sidebar.slider("T3 (×ATR)", 0.5, 4.0, 1.5, 0.05)
+spike_z   = st.sidebar.slider("Spike Z-score", 1.5, 4.0, 2.0, 0.1)
+
+# Robust width options: include 12 and 18 for presets.
+options_dir = [5,10,12,15,18,20,25,30]
+cur_dir = st.session_state.get("dir_width", 10)
+if cur_dir not in options_dir:
+    cur_dir = min(options_dir, key=lambda x: abs(x - cur_dir))
+    st.session_state["dir_width"] = cur_dir
+
+ic_width_1d = st.sidebar.select_slider("IC Width 1D (pts)", options=[5,10,15,20,25,30], value=st.session_state["ic_width_1d"], key="ic_width_1d")
+ic_width_1w = st.sidebar.select_slider("IC Width 1W (pts)", options=[5,10,15,20,25,30], value=st.session_state["ic_width_1w"], key="ic_width_1w")
+dir_width   = st.sidebar.select_slider("PCS/CCS Width (pts)", options=options_dir, value=cur_dir, key="dir_width")
+delta_decay = st.sidebar.slider("Delta Proxy Decay (↑=more conservative)", 0.5, 1.5, st.session_state["delta_decay"], 0.05, key="delta_decay")
+clamp_x     = st.sidebar.checkbox("Fit X-axis to selected window", st.session_state["clamp_x"], key="clamp_x")
 
 # Discover CSVs
 csv_paths = sorted(glob.glob(os.path.join(data_folder, "*.csv")))
@@ -492,22 +554,18 @@ if not csv_paths:
 def _sym(p): return os.path.splitext(os.path.basename(p))[0].upper()
 opts = [_sym(p) for p in csv_paths]
 default_sym = "SPX" if "SPX" in opts else opts[0]
-
-# Symbol dropdown
 symbol = st.selectbox("Symbol", opts, index=opts.index(default_sym), key="symbol")
 
-# Load selected
+# Load and prepare
 path = csv_paths[opts.index(symbol)]
 src = load_csv(path)
 
-# ES1 volume proxy for SPX
 es1_path = None
 for p in csv_paths:
     if _sym(p) == "ES1":
         es1_path = p; break
 src_es1 = load_csv(es1_path) if (symbol == "SPX" and es1_path) else None
 
-# Build resampled frames
 d1h = resample_ohlcv(src, "1H")
 d4h = resample_ohlcv(src, "4H")
 d1d = resample_ohlcv(src, "1D")
@@ -527,13 +585,11 @@ if symbol == "SPX" and src_es1 is not None:
     d1d = inject_proxy_vol(d1d, src_es1, "1D")
     d1w = inject_proxy_vol(d1w, src_es1, "1W")
 
-# Enrich
 d1h = enrich(d1h, spike_z=spike_z)
 d4h = enrich(d4h, spike_z=spike_z)
 d1d = enrich(d1d, spike_z=spike_z)
 d1w = enrich(d1w, spike_z=spike_z)
 
-# Subset windows
 def _subset_days(df: pd.DataFrame, n: int) -> pd.DataFrame:
     d = df.copy()
     d["date"] = pd.to_datetime(d["date"])
@@ -543,12 +599,12 @@ def _subset_days(df: pd.DataFrame, n: int) -> pd.DataFrame:
 def _subset_weeks(df: pd.DataFrame, n: int) -> pd.DataFrame:
     return _subset_days(df, n*7)
 
-d1h_view = _subset_days(d1h, days_1h)
-d4h_view = _subset_days(d4h, days_4h)
-d1d_view = _subset_days(d1d, days_1d)
-d1w_view = _subset_weeks(d1w, weeks_1w)
+d1h_view = _subset_days(d1h, st.session_state["days_1h"])
+d4h_view = _subset_days(d4h, st.session_state["days_4h"])
+d1d_view = _subset_days(d1d, st.session_state["days_1d"])
+d1w_view = _subset_weeks(d1w, st.session_state["weeks_1w"])
 
-# Opening 15m & header tags
+# Header panel (based on 1H)
 open15 = opening_15_close(src)
 plan_1h = build_trade_plan(d1h_view)
 strikes_1h = strike_suggestions(d1h_view, plan_1h)
@@ -556,26 +612,23 @@ alert_1h = tape_alert_text(d1h_view, plan_1h)
 last = d1h_view.iloc[-1]
 pa_text = price_action_tag(float(last["close"]), open15)
 
-# ---- Projected ranges for header ----
-use_b = (range_method == "ATR + BB + S/R")
-use_s = (range_method == "ATR + BB + S/R")
+use_b = (st.session_state["range_method"] == "ATR + BB + S/R")
+use_s = (st.session_state["range_method"] == "ATR + BB + S/R")
 lo_1h, hi_1h = projected_range(d1h_view, k_atr=0.75, use_bbands=use_b, use_sr=use_s)
 lo_4h, hi_4h = projected_range(d4h_view, k_atr=1.00, use_bbands=use_b, use_sr=use_s)
 lo_1d, hi_1d = projected_range(d1d_view, k_atr=1.25, use_bbands=use_b, use_sr=use_s)
 lo_1w, hi_1w = projected_range(d1w_view, k_atr=1.50, use_bbands=use_b, use_sr=use_s)
 
-def _fmt(x):
-    return f"{x:.1f}" if x is not None else "—"
+def _fmt(x): return f"{x:.1f}" if x is not None else "—"
 
 header_ranges = (
     f"Ranges → 1H {_fmt(lo_1h)}–{_fmt(hi_1h)} · "
     f"4H {_fmt(lo_4h)}–{_fmt(hi_4h)} · "
     f"1D {_fmt(lo_1d)}–{_fmt(hi_1d)} · "
     f"1W {_fmt(lo_1w)}–{_fmt(hi_1w)} "
-    f"({range_method})"
+    f"({st.session_state['range_method']})"
 )
 
-# Header summary
 st.markdown(f"### {symbol} — 1H")
 st.write(f"Close {last['close']:.2f} · ATR {plan_1h['atr']:.2f} · ADX {plan_1h['adx']:.1f} · {pa_text}")
 st.write(f"Bias: **{plan_1h['bias']}** · Strategy: **{plan_1h['strategy']}**")
@@ -587,19 +640,8 @@ st.write(f"Strikes → PCS {strikes_1h['PCS'][0]}/{strikes_1h['PCS'][1]} · "
          f"CCS {strikes_1h['CCS'][0]}/{strikes_1h['CCS'][1]} · "
          f"IC {strikes_1h['IC'][0]}/{strikes_1h['IC'][1]} · {strikes_1h['IC'][2]}/{strikes_1h['IC'][3]}")
 
-# --- Quick IC rails from 1D/1W ranges ---
-def _ic_block(lo, hi, atr):
-    if lo is None or hi is None or atr is None or atr == 0:
-        return "—", np.nan, np.nan
-    put = _round5(lo); call = _round5(hi)
-    put_long, call_long = put - ic_width, call + ic_width
-    # delta proxies based on distance in ATR
-    mid = (lo + hi) / 2.0  # not used; use short vs spot distance
-    # We use last close from the corresponding timeframe (approx with 1H last close)
-    return f"{put}/{put_long} & {call}/{call_long}", put, call
-
-# Compute IC rails + delta proxies
-def _delta_for_frame(df_view, short_put, short_call):
+# Quick header IC summaries (1D/1W) + delta proxies
+def delta_proxy_for_frame(df_view, short_put, short_call, decay):
     if df_view is None or len(df_view)==0 or short_put is None or short_call is None:
         return np.nan, np.nan
     close = float(df_view["close"].iloc[-1])
@@ -608,55 +650,61 @@ def _delta_for_frame(df_view, short_put, short_call):
         return np.nan, np.nan
     dist_put = max(0.0, (close - short_put) / atr)
     dist_call = max(0.0, (short_call - close) / atr)
-    return delta_proxy_from_dist(dist_put), delta_proxy_from_dist(dist_call)
+    return delta_proxy_from_dist(dist_put, decay), delta_proxy_from_dist(dist_call, decay)
 
-ic_1d_text, put_1d, call_1d = _ic_block(lo_1d, hi_1d, float(d1d_view["atr"].iloc[-1]) if "atr" in d1d_view.columns and not d1d_view["atr"].isna().all() else None)
-ic_1w_text, put_1w, call_1w = _ic_block(lo_1w, hi_1w, float(d1w_view["atr"].iloc[-1]) if "atr" in d1w_view.columns and not d1w_view["atr"].isna().all() else None)
+def build_ic_text(lo, hi, width_pts):
+    if lo is None or hi is None: return "—", None, None
+    sp = _round5(lo); sc = _round5(hi)
+    return f"{sp}/{sp-width_pts} & {sc}/{sc+width_pts}", sp, sc
 
-p_delta_1d, c_delta_1d = _delta_for_frame(d1d_view, put_1d, call_1d)
-p_delta_1w, c_delta_1w = _delta_for_frame(d1w_view, put_1w, call_1w)
+ic_1d_text, put_1d, call_1d = build_ic_text(lo_1d, hi_1d, st.session_state["ic_width_1d"])
+ic_1w_text, put_1w, call_1w = build_ic_text(lo_1w, hi_1w, st.session_state["ic_width_1w"])
+p_delta_1d, c_delta_1d = delta_proxy_for_frame(d1d_view, put_1d, call_1d, st.session_state["delta_decay"])
+p_delta_1w, c_delta_1w = delta_proxy_for_frame(d1w_view, put_1w, call_1w, st.session_state["delta_decay"])
 
 st.markdown(
-    f"<div style='opacity:0.9'>"
-    f"<b>IC 1D Rails:</b> {ic_1d_text} "
-    f"(Δ≈{p_delta_1d:.2f} / {c_delta_1d:.2f}) &nbsp; · &nbsp; "
-    f"<b>IC 1W Rails:</b> {ic_1w_text} "
-    f"(Δ≈{p_delta_1w:.2f} / {c_delta_1w:.2f})"
-    f"</div>", unsafe_allow_html=True
+    f"<div style='opacity:0.95'><b>IC 1D:</b> {ic_1d_text} (Δ≈{p_delta_1d:.2f}/{c_delta_1d:.2f}) &nbsp; · "
+    f"<b>IC 1W:</b> {ic_1w_text} (Δ≈{p_delta_1w:.2f}/{c_delta_1w:.2f})</div>",
+    unsafe_allow_html=True
 )
 
 if alert_1h:
     st.info(f"⚡ Tape Alert: {alert_1h}")
 
-# Tabs with charts (1H/4H/1D/1W)
+# ---------------- Tabs ----------------
 tab1, tab2, tab3, tab4 = st.tabs(["1H", "4H", "1D", "1W"])
 
 def _render_tab(df, lbl):
     plan = build_trade_plan(df)
-    lv = compute_trade_levels(df, plan, stop_mult=stop_mult,
-                              t1_mult=t1_mult, t2_mult=t2_mult, t3_mult=t3_mult)
+    lv = compute_trade_levels(df, plan, stop_mult=0.8, t1_mult=0.5, t2_mult=1.0, t3_mult=1.5)
     st.markdown(f"### {symbol} — {lbl}")
     if lv:
         if 'primary' in lv:
             p = lv['primary']
-            st.caption(f"**{p['direction'].upper()}** · E:{p['entry']:.1f} · S:{p['stop']:.1f} · "
-                       f"T1:{p['t1']:.1f} · T2:{p['t2']:.1f} · T3:{p['t3']:.1f}")
+            st.caption(f"**{p['direction'].upper()}** · E:{p['entry']:.1f} · S:{p['stop']:.1f} · T1:{p['t1']:.1f} · T2:{p['t2']:.1f} · T3:{p['t3']:.1f}")
         else:
-            st.caption(f"**LONG** · E:{lv['long']['entry']:.1f} · S:{lv['long']['stop']:.1f} · "
-                       f"T1:{lv['long']['t1']:.1f} · T2:{lv['long']['t2']:.1f} · T3:{lv['long']['t3']:.1f}")
-            st.caption(f"**SHORT** · E:{lv['short']['entry']:.1f} · S:{lv['short']['stop']:.1f} · "
-                       f"T1:{lv['short']['t1']:.1f} · T2:{lv['short']['t2']:.1f} · T3:{lv['short']['t3']:.1f}")
-    # range band for tab
+            st.caption(f"**LONG** · E:{lv['long']['entry']:.1f} · S:{lv['long']['stop']:.1f} · T1:{lv['long']['t1']:.1f} · T2:{lv['long']['t2']:.1f} · T3:{lv['long']['t3']:.1f}")
+            st.caption(f"**SHORT** · E:{lv['short']['entry']:.1f} · S:{lv['short']['stop']:.1f} · T1:{lv['short']['t1']:.1f} · T2:{lv['short']['t2']:.1f} · T3:{lv['short']['t3']:.1f}")
+
     k_map = {"1H":0.75,"4H":1.00,"1D":1.25,"1W":1.50}
-    use_b = (range_method == "ATR + BB + S/R")
-    use_s = (range_method == "ATR + BB + S/R")
+    use_b = (st.session_state["range_method"] == "ATR + BB + S/R")
+    use_s = (st.session_state["range_method"] == "ATR + BB + S/R")
     lo, hi = projected_range(df, k_atr=k_map[lbl], use_bbands=use_b, use_sr=use_s)
     if lo is not None and hi is not None:
         st.caption(f"Projected Range: {lo:.1f} — {hi:.1f}")
-    fig = make_chart(df, f"{symbol} — {lbl}", height=520, show_bbands=show_bbands, show_vol=show_vol)
-    if show_levels: fig = add_levels_to_figure(fig, lv)
+
+    fig = make_chart(df, f"{symbol} — {lbl}", height=520, show_bbands=show_bbands, show_vol=show_vol, clamp_x=st.session_state["clamp_x"])
+    fig = add_levels_to_figure(fig, lv) if True else fig
     if lo is not None and hi is not None:
         fig.add_hrect(y0=lo, y1=hi, fillcolor="rgba(80,180,255,0.08)", line_width=0)
+
+    # Rail badge
+    ic_w = st.session_state["ic_width_1d"] if lbl=="1D" else st.session_state["ic_width_1w"] if lbl=="1W" else st.session_state["ic_width_1d"]
+    dir_w = st.session_state["dir_width"]
+    main, aux = make_rail_texts(df, lo, hi, plan["bias"], ic_w, dir_w, st.session_state["delta_decay"])
+    badge_color = {"BULLISH":PALETTE["bull"], "BEARISH":PALETTE["bear"], "NEUTRAL":PALETTE["accent"]}.get(plan["bias"], PALETTE["accent"])
+    fig = add_rail_badge(fig, main, aux, bias_color=badge_color)
+
     st.plotly_chart(fig, use_container_width=True)
 
 with tab1: _render_tab(d1h_view, "1H")
