@@ -560,11 +560,52 @@ symbol = st.selectbox("Symbol", opts, index=opts.index(default_sym), key="symbol
 path = csv_paths[opts.index(symbol)]
 src = load_csv(path)
 
+
 es1_path = None
 for p in csv_paths:
     if _sym(p) == "ES1":
         es1_path = p; break
 src_es1 = load_csv(es1_path) if (symbol == "SPX" and es1_path) else None
+
+# --- AFTER loading paths and calling: src = load_csv(path) and (optionally) src_es1 = load_csv(es1_path) ---
+
+# NEW: Back-date control (default = all data)
+min_d = src["date"].min().date()
+max_d = src["date"].max().date()
+
+use_cap = st.sidebar.checkbox(
+    "Limit data up to date",
+    value=False,
+    help="Backtest past sessions by hiding all bars after the selected date (EOD).",
+)
+
+cap_date = st.sidebar.date_input(
+    "Data end date (EOD)",
+    value=max_d,
+    min_value=min_d,
+    max_value=max_d,
+    disabled=not use_cap,
+)
+
+if use_cap:
+    # cap at end-of-day (naive UTC in this app)
+    cap_dt = pd.Timestamp(cap_date) + pd.Timedelta(hours=23, minutes=59, seconds=59)
+    src = src[src["date"] <= cap_dt].copy()
+    if 'src_es1' in locals() and src_es1 is not None:
+        src_es1 = src_es1[src_es1["date"] <= cap_dt].copy()
+
+    if src.empty:
+        st.warning("No data on or before the selected date. Showing original dataset.")
+        # fall back to full data if user picked too-early a date
+        src = load_csv(path)
+        if 'src_es1' in locals() and es1_path:
+            src_es1 = load_csv(es1_path)
+
+    # small banner so it’s obvious we’re not on latest data
+    st.caption(f"🔒 Backtest mode: using data through **{cap_date.isoformat()}**")
+
+
+
 
 d1h = resample_ohlcv(src, "1H")
 d4h = resample_ohlcv(src, "4H")
